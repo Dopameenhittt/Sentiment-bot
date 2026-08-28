@@ -2,6 +2,10 @@ import os
 import csv
 import time
 import json
+import os
+import csv
+import time
+import json
 import threading
 import feedparser
 import requests
@@ -9,6 +13,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 from google import genai
 
 # ================= CONFIGURATION =================
@@ -25,13 +30,12 @@ RSS_FEEDS = {
 TARGET_ASSETS = ["BTC", "ETH", "NVDA", "GOLD", "XAUUSD", "FED", "SPY", "TSLA"]
 KEYWORDS = ["BTC", "ETH", "FED", "NVDA", "GOLD", "XAUUSD", "CALLS", "PUTS", "BITCOIN", "RATE CUT", "INFLATION", "SPY", "TSLA"]
 CSV_FILE = "market_sentiment.csv"
-INTERVAL_SECONDS = 300
+INTERVAL_SECONDS = 180  # ปรับเป็นตรวจเช็กทุกๆ 3 นาที
 
 TELEGRAM_BOT_TOKEN = "8286819909:AAEgdSYG2-ogY4Ir3P_xJi1nzKapKcle75Q"
 TELEGRAM_CHAT_ID = "8926277994"
 # =================================================
 
-# ================= 1. BACKGROUND SCANNER BOT =================
 def detect_asset(text):
     text_upper = text.upper()
     for asset in TARGET_ASSETS:
@@ -92,8 +96,16 @@ def save_to_csv(rows):
         for r in rows:
             writer.writerow([r["source"], r["asset"], r["title"], r["sentiment"], r["confidence"], r["action"], r["reason"], r["link"], r["time"]])
 
+def fetch_feed_custom(url):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        return feedparser.parse(resp.content)
+    except Exception:
+        return feedparser.parse(url)
+
 def background_bot_worker():
-    print("=== Background Bot Started ===")
+    print("=== Background Bot Active 24/7 ===")
     client = genai.Client(api_key=GEMINI_API_KEY.strip())
     processed_links = set()
 
@@ -112,7 +124,7 @@ def background_bot_worker():
         try:
             new_records = []
             for source_name, url in RSS_FEEDS.items():
-                feed = feedparser.parse(url)
+                feed = fetch_feed_custom(url)
                 for entry in feed.entries:
                     link = entry.get("link", "")
                     if link in processed_links:
@@ -145,13 +157,15 @@ def background_bot_worker():
 
             if new_records:
                 save_to_csv(new_records)
-                print(f"[{time.strftime('%H:%M:%S')}] Saved {len(new_records)} items.")
+                print(f"[{time.strftime('%H:%M:%S')}] Saved {len(new_records)} new items.")
+            else:
+                print(f"[{time.strftime('%H:%M:%S')}] Scan complete. No new items.")
         except Exception as e:
             print(f"Worker Error: {e}")
 
         time.sleep(INTERVAL_SECONDS)
 
-# เริ่ม Background Bot Thread ครั้งเดียวเมื่อแอปสตาร์ท
+# เริ่ม Background Bot Thread
 @st.cache_resource
 def start_bot():
     thread = threading.Thread(target=background_bot_worker, daemon=True)
@@ -162,10 +176,14 @@ start_bot()
 
 # ================= 2. STREAMLIT UI =================
 st.set_page_config(page_title="AI Market Sentiment Terminal", layout="wide")
+
+# Auto refresh หน้าเว็บทุก 30 วินาทีอัตโนมัติ
+st_autorefresh(interval=30000, key="datarefresh")
+
 st.title("📈 AI Market Sentiment & Fear/Greed Terminal (24/7 Cloud)")
 
 st.sidebar.header("🕹 Control Panel")
-if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
+if st.sidebar.button("🔄 Force Refresh", use_container_width=True):
     st.rerun()
 
 if not os.path.exists(CSV_FILE):
