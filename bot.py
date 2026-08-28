@@ -1,10 +1,28 @@
-import csv
 import os
+import csv
 import time
 import json
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import feedparser
 import requests
 from google import genai
+
+# ===== 1. FAKE WEB SERVER สำหรับ RENDER FREE TIER =====
+class DummyServer(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Sentiment Bot is Running 24/7!")
+
+def start_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), DummyServer)
+    server.serve_forever()
+
+threading.Thread(target=start_server, daemon=True).start()
+# ===================================================
 
 # ================= CONFIGURATION =================
 GEMINI_API_KEY = "AQ.Ab8RN6LcdK1NXuQFfuGeTBJXVnxz2vVBB__122KbqQQPw1dUtw"
@@ -17,11 +35,10 @@ RSS_FEEDS = {
     "CoinDesk": "https://www.coindesk.com/arc/outboundfeeds/rss/"
 }
 
-# กำหนดสินทรัพย์ที่ต้องการแท็ก
 TARGET_ASSETS = ["BTC", "ETH", "NVDA", "GOLD", "XAUUSD", "FED", "SPY", "TSLA"]
 KEYWORDS = ["BTC", "ETH", "FED", "NVDA", "GOLD", "XAUUSD", "CALLS", "PUTS", "BITCOIN", "RATE CUT", "INFLATION", "SPY", "TSLA"]
 CSV_FILE = "market_sentiment.csv"
-INTERVAL_SECONDS = 300  # เช็กทุก 5 นาที
+INTERVAL_SECONDS = 300
 
 TELEGRAM_BOT_TOKEN = "8286819909:AAEgdSYG2-ogY4Ir3P_xJi1nzKapKcle75Q"
 TELEGRAM_CHAT_ID = "8926277994"
@@ -144,7 +161,7 @@ def scan_all():
     else:
         print("ยังไม่มีข่าวหรือโพสต์ใหม่")
 
-print("=== Market Sentiment Bot (Asset Tagging + Real-time Alerts) ===")
+print("=== Market Sentiment Bot (Cloud Ready) ===")
 while True:
     try:
         scan_all()
