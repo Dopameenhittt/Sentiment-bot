@@ -1,6 +1,7 @@
 google-genai
 feedparser
 requests
-streamlit
 pandas
 plotly
+streamlit
+streamlit-autorefresh
