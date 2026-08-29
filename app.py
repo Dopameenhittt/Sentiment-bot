@@ -125,8 +125,9 @@ def save_records(rows):
                     cur.execute(
                         """
                         INSERT INTO market_sentiment
-                            (link_url, source, asset, title, sentiment, confidence, action, reason)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                            (link, source, asset, title, sentiment, confidence, action, reason)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (link) DO NOTHING;
                         """,
                         (r["link"], r["source"], r["asset"], r["title"],
                          r["sentiment"], r["confidence"], r["action"], r["reason"])
@@ -248,10 +249,10 @@ def load_dashboard_data():
                 """
                 SELECT source AS "Source", asset AS "Asset", title AS "Title",
                        sentiment AS "Sentiment", confidence AS "Confidence",
-                       action AS "Action", reason AS "Reason", link_url AS "Link",
-                       created_at AS "Timestamp"
+                       action AS "Action", reason AS "Reason", link AS "Link",
+                       timestamp AS "Timestamp"
                 FROM market_sentiment
-                ORDER BY created_at DESC
+                ORDER BY timestamp DESC
                 LIMIT 500;
                 """,
                 conn
