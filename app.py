@@ -89,7 +89,8 @@ def analyze_advanced(client, title):
             config={"response_mime_type": "application/json"}
         )
         return json.loads(response.text.strip())
-    except Exception:
+    except Exception as e:
+        print(f"Gemini analyze error: {type(e).__name__}: {e}")
         return {
             "sentiment": "Neutral",
             "confidence": 50,
