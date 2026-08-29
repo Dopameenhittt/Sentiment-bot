@@ -1,15 +1,12 @@
 import os
-import csv
-import time
-import json
-import os
-import csv
 import time
 import json
 import threading
 import feedparser
 import requests
 import pandas as pd
+import psycopg2
+import psycopg2.extras
 import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
@@ -17,7 +14,16 @@ from streamlit_autorefresh import st_autorefresh
 from google import genai
 
 # ================= CONFIGURATION =================
-GEMINI_API_KEY = "AQ.Ab8RN6LcdK1NXuQFfuGeTBJXVnxz2vVBB__122KbqQQPw1dUtw"
+# ทุกค่าสำคัญตอนนี้อ่านจาก Environment Variables แทนการฝังในโค้ด
+# ต้องตั้งค่าเหล่านี้ใน Render > Environment ก่อนรัน:
+#   GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is not set. Add it in Render > Environment.")
 
 RSS_FEEDS = {
     "Reddit/WSB": "https://www.reddit.com/r/wallstreetbets/new/.rss",
@@ -29,12 +35,14 @@ RSS_FEEDS = {
 
 TARGET_ASSETS = ["BTC", "ETH", "NVDA", "GOLD", "XAUUSD", "FED", "SPY", "TSLA"]
 KEYWORDS = ["BTC", "ETH", "FED", "NVDA", "GOLD", "XAUUSD", "CALLS", "PUTS", "BITCOIN", "RATE CUT", "INFLATION", "SPY", "TSLA"]
-CSV_FILE = "market_sentiment.csv"
-INTERVAL_SECONDS = 180  # ปรับเป็นตรวจเช็กทุกๆ 3 นาที
-
-TELEGRAM_BOT_TOKEN = "8286819909:AAEgdSYG2-ogY4Ir3P_xJi1nzKapKcle75Q"
-TELEGRAM_CHAT_ID = "8926277994"
+INTERVAL_SECONDS = 180  # ตรวจเช็กทุก 3 นาที
 # =================================================
+
+
+def get_conn():
+    """เปิด connection ใหม่ทุกครั้งที่เรียก กัน connection ค้าง/หลุด"""
+    return psycopg2.connect(DATABASE_URL)
+
 
 def detect_asset(text):
     text_upper = text.upper()
@@ -42,6 +50,7 @@ def detect_asset(text):
         if asset in text_upper or (asset == "BTC" and "BITCOIN" in text_upper) or (asset == "GOLD" and "XAU" in text_upper):
             return asset
     return "General Market"
+
 
 def send_telegram_alert(source, asset, title, sentiment, confidence, action, reason, link):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -60,6 +69,7 @@ def send_telegram_alert(source, asset, title, sentiment, confidence, action, rea
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
     except Exception as e:
         print(f"Telegram Error: {e}")
+
 
 def analyze_advanced(client, title):
     prompt = f"""
@@ -87,14 +97,49 @@ def analyze_advanced(client, title):
             "reason": "Analysis unavailable"
         }
 
-def save_to_csv(rows):
-    file_exists = os.path.isfile(CSV_FILE)
-    with open(CSV_FILE, mode="a", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["Source", "Asset", "Title", "Sentiment", "Confidence", "Action", "Reason", "Link", "Timestamp"])
-        for r in rows:
-            writer.writerow([r["source"], r["asset"], r["title"], r["sentiment"], r["confidence"], r["action"], r["reason"], r["link"], r["time"]])
+
+def load_processed_links():
+    """โหลดลิงก์ที่เคยวิเคราะห์แล้วจาก Neon ตอน bot เริ่มทำงาน"""
+    links = set()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT link_url FROM processed_links;")
+                links = {row[0] for row in cur.fetchall()}
+    except Exception as e:
+        print(f"Load processed_links error: {e}")
+    return links
+
+
+def save_records(rows):
+    """บันทึกผลวิเคราะห์ + ลิงก์ที่ประมวลผลแล้วลง Neon (แทน CSV เดิม)"""
+    if not rows:
+        return
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                for r in rows:
+                    cur.execute(
+                        """
+                        INSERT INTO market_sentiment
+                            (link_url, source, asset, title, sentiment, confidence, action, reason)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                        """,
+                        (r["link"], r["source"], r["asset"], r["title"],
+                         r["sentiment"], r["confidence"], r["action"], r["reason"])
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO processed_links (link_url)
+                        VALUES (%s)
+                        ON CONFLICT (link_url) DO NOTHING;
+                        """,
+                        (r["link"],)
+                    )
+            conn.commit()
+    except Exception as e:
+        print(f"Save to Neon error: {e}")
+
 
 def fetch_feed_custom(url):
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -104,21 +149,12 @@ def fetch_feed_custom(url):
     except Exception:
         return feedparser.parse(url)
 
-def background_bot_worker():
-    print("=== Background Bot Active 24/7 ===")
-    client = genai.Client(api_key=GEMINI_API_KEY.strip())
-    processed_links = set()
 
-    if os.path.isfile(CSV_FILE):
-        try:
-            with open(CSV_FILE, mode="r", encoding="utf-8-sig") as f:
-                reader = csv.reader(f)
-                next(reader, None)
-                for row in reader:
-                    if len(row) >= 8:
-                        processed_links.add(row[7])
-        except Exception:
-            pass
+def background_bot_worker():
+    print("=== Background Bot Active 24/7 (Neon-backed) ===")
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    processed_links = load_processed_links()
+    print(f"Loaded {len(processed_links)} previously processed links from Neon.")
 
     while True:
         try:
@@ -127,7 +163,7 @@ def background_bot_worker():
                 feed = fetch_feed_custom(url)
                 for entry in feed.entries:
                     link = entry.get("link", "")
-                    if link in processed_links:
+                    if not link or link in processed_links:
                         continue
 
                     title = entry.get("title", "")
@@ -147,23 +183,24 @@ def background_bot_worker():
                             "action": res.get("action", "Wait and See"),
                             "reason": res.get("reason", "-"),
                             "link": link,
-                            "time": time.strftime("%Y-%m-%d %H:%M:%S")
                         }
                         new_records.append(record)
                         processed_links.add(link)
 
                         if record["confidence"] >= 65 and record["sentiment"] in ["Bullish", "Bearish"]:
-                            send_telegram_alert(source_name, asset_tag, title, record["sentiment"], record["confidence"], record["action"], record["reason"], link)
+                            send_telegram_alert(source_name, asset_tag, title, record["sentiment"],
+                                                 record["confidence"], record["action"], record["reason"], link)
 
             if new_records:
-                save_to_csv(new_records)
-                print(f"[{time.strftime('%H:%M:%S')}] Saved {len(new_records)} new items.")
+                save_records(new_records)
+                print(f"[{time.strftime('%H:%M:%S')}] Saved {len(new_records)} new items to Neon.")
             else:
                 print(f"[{time.strftime('%H:%M:%S')}] Scan complete. No new items.")
         except Exception as e:
             print(f"Worker Error: {e}")
 
         time.sleep(INTERVAL_SECONDS)
+
 
 # เริ่ม Background Bot Thread
 @st.cache_resource
@@ -172,9 +209,10 @@ def start_bot():
     thread.start()
     return True
 
+
 start_bot()
 
-# ================= 2. STREAMLIT UI =================
+# ================= STREAMLIT UI =================
 st.set_page_config(page_title="AI Market Sentiment Terminal", layout="wide")
 
 # Auto refresh หน้าเว็บทุก 30 วินาทีอัตโนมัติ
@@ -186,18 +224,34 @@ st.sidebar.header("🕹 Control Panel")
 if st.sidebar.button("🔄 Force Refresh", use_container_width=True):
     st.rerun()
 
-if not os.path.exists(CSV_FILE):
-    st.info("กำลังรอ Background Bot สแกนและสร้างไฟล์ข้อมูลรอบแรก...")
-    st.stop()
 
-try:
-    df = pd.read_csv(CSV_FILE, on_bad_lines="skip", encoding="utf-8-sig")
-except Exception as e:
-    st.error(f"Error loading CSV: {e}")
-    st.stop()
+@st.cache_data(ttl=25)
+def load_dashboard_data():
+    """ดึงข้อมูลล่าสุดจาก Neon มาแสดงในแดชบอร์ด"""
+    try:
+        with get_conn() as conn:
+            df = pd.read_sql(
+                """
+                SELECT source AS "Source", asset AS "Asset", title AS "Title",
+                       sentiment AS "Sentiment", confidence AS "Confidence",
+                       action AS "Action", reason AS "Reason", link_url AS "Link",
+                       created_at AS "Timestamp"
+                FROM market_sentiment
+                ORDER BY created_at DESC
+                LIMIT 500;
+                """,
+                conn
+            )
+        return df
+    except Exception as e:
+        st.error(f"Error loading data from Neon: {e}")
+        return pd.DataFrame()
+
+
+df = load_dashboard_data()
 
 if df.empty or "Sentiment" not in df.columns:
-    st.info("ยังไม่มีข้อมูลเพียงพอสำหรับการวิเคราะห์...")
+    st.info("ยังไม่มีข้อมูลเพียงพอสำหรับการวิเคราะห์ กำลังรอ Background Bot สแกนรอบแรก...")
     st.stop()
 
 if "Asset" in df.columns:
@@ -253,8 +307,8 @@ with col_gauge:
 with col_pie:
     st.subheader("📊 Sentiment Breakdown")
     fig_pie = px.pie(
-        df, 
-        names="Sentiment", 
+        df,
+        names="Sentiment",
         color="Sentiment",
         color_discrete_map={"Bullish": "#2ecc71", "Bearish": "#e74c3c", "Neutral": "#95a5a6"}
     )
