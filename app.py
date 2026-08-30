@@ -65,7 +65,7 @@ Headline: "{title}"
 Respond strictly in JSON: {{"is_catalyst": true or false}}"""
     try:
         response = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model="openai/gpt-oss-20b",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=0,
