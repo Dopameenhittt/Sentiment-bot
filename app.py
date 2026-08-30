@@ -12,12 +12,14 @@ import plotly.express as px
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from google import genai
+from groq import Groq
 
 # ================= CONFIGURATION =================
 # ทุกค่าสำคัญตอนนี้อ่านจาก Environment Variables แทนการฝังในโค้ด
 # ต้องตั้งค่าเหล่านี้ใน Render > Environment ก่อนรัน:
-#   GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL
+#   GEMINI_API_KEY, GROQ_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
@@ -25,12 +27,13 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set. Add it in Render > Environment.")
 
+# เรียงลำดับความสำคัญ: ข่าวการจริง (catalyst) ก่อน กระแสความคิดเห็นใน Reddit ไว้ท้ายสุด
 RSS_FEEDS = {
+    "Yahoo Finance": "https://finance.yahoo.com/news/rssindex",
+    "CoinDesk": "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "Reddit/WSB": "https://www.reddit.com/r/wallstreetbets/new/.rss",
     "Reddit/Crypto": "https://www.reddit.com/r/CryptoCurrency/new/.rss",
     "Reddit/Stocks": "https://www.reddit.com/r/stocks/new/.rss",
-    "Yahoo Finance": "https://finance.yahoo.com/news/rssindex",
-    "CoinDesk": "https://www.coindesk.com/arc/outboundfeeds/rss/"
 }
 
 TARGET_ASSETS = ["BTC", "ETH", "NVDA", "GOLD", "XAUUSD", "FED", "SPY", "TSLA"]
@@ -38,12 +41,53 @@ KEYWORDS = ["BTC", "ETH", "FED", "NVDA", "GOLD", "XAUUSD", "CALLS", "PUTS", "BIT
 INTERVAL_SECONDS = 180  # ตรวจเช็กทุก 3 นาที
 MAX_ANALYSES_PER_SCAN = 8   # จำกัดจำนวนข่าวที่ยิงเข้า Gemini ต่อรอบ กันชนโควตา
 GEMINI_CALL_DELAY_SECONDS = 4  # หน่วงเวลาระหว่างการเรียก Gemini แต่ละครั้ง
+ALERT_CONFIDENCE_THRESHOLD = 80  # day trade ต้องมั่นใจสูงกว่าการถือยาว ถึงจะแจ้งเตือน
 # =================================================
 
 
 def get_conn():
     """เปิด connection ใหม่ทุกครั้งที่เรียก กัน connection ค้าง/หลุด"""
     return psycopg2.connect(DATABASE_URL)
+
+
+def screen_with_groq(groq_client, title):
+    """
+    คัดกรองก่อนว่าข่าวนี้เป็น catalyst ที่มีโอกาสขยับราคาจริงไหม
+    ใช้ Groq (โควตาฟรีสูงกว่า Gemini มาก) เป็นด่านแรก ประหยัดโควตา Gemini
+    ไว้สำหรับข่าวที่มีโอกาสเป็นสัญญาณจริงเท่านั้น
+    """
+    if not GROQ_API_KEY:
+        return True  # ไม่ได้ตั้งค่า Groq ไว้ ให้ผ่านไปวิเคราะห์กับ Gemini ตามปกติ
+    prompt = f"""Is this news headline likely to be a real market-moving catalyst
+(e.g. Fed decision, regulation, earnings, major hack/exploit, macro data)
+as opposed to casual opinion/chatter/meme content?
+Headline: "{title}"
+Respond strictly in JSON: {{"is_catalyst": true or false}}"""
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        result = json.loads(response.choices[0].message.content)
+        return bool(result.get("is_catalyst", False))
+    except Exception as e:
+        print(f"Groq screen error: {type(e).__name__}: {e}")
+        return True  # Groq ล้มเหลว ให้ผ่านไปให้ Gemini ตัดสินแทน กันข่าวสำคัญหลุด
+
+
+def get_news_lag_minutes(entry):
+    """คำนวณว่าข่าวนี้เก่าไปแล้วกี่นาที นับจากเวลา publish ถึงตอนนี้ (สำหรับโชว์ lag จริง)"""
+    published = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not published:
+        return None
+    try:
+        published_ts = time.mktime(published)
+        lag_seconds = time.time() - published_ts
+        return max(0, round(lag_seconds / 60))
+    except Exception:
+        return None
 
 
 def detect_asset(text):
@@ -54,14 +98,19 @@ def detect_asset(text):
     return "General Market"
 
 
-def send_telegram_alert(source, asset, title, sentiment, confidence, action, reason, link):
+def send_telegram_alert(source, asset, title, sentiment, confidence, action, reason, link, lag_minutes=None):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     emoji = "🟢" if sentiment == "Bullish" else "🔴" if sentiment == "Bearish" else "⚪"
+    lag_line = ""
+    if lag_minutes is not None:
+        lag_warning = " ⚠️ ข่าวช้าไปแล้ว ตรวจราคาก่อนเข้าไม้" if lag_minutes >= 5 else ""
+        lag_line = f"⏱ *News Lag:* {lag_minutes} นาที{lag_warning}\n"
     msg = (
         f"{emoji} *Market Alert [{asset} - {sentiment}]* ({confidence}% Conf)\n\n"
         f"📡 *Source:* {source}\n"
         f"📌 *Title:* {title}\n"
+        f"{lag_line}"
         f"⚡ *Action:* `{action}`\n"
         f"💡 *Reason:* {reason}\n"
         f"🔗 [View Source]({link})"
@@ -86,7 +135,7 @@ def analyze_advanced(client, title):
     """
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=prompt,
             config={"response_mime_type": "application/json"}
         )
@@ -114,10 +163,10 @@ def load_processed_links():
     return links
 
 
-def save_records(rows):
-    """บันทึกผลวิเคราะห์ + ลิงก์ที่ประมวลผลแล้วลง Neon (แทน CSV เดิม)"""
-    if not rows:
-        return
+def save_records(rows, skipped_links=None):
+    """บันทึกผลวิเคราะห์ + ลิงก์ที่ประมวลผลแล้วลง Neon (แทน CSV เดิม)
+    skipped_links: ลิงก์ที่ Groq คัดว่าไม่ใช่ catalyst ต้องบันทึกลง processed_links ด้วย
+    เพื่อไม่ต้องคัดกรองซ้ำในรอบถัดไป (ไม่ต้องมีแถวใน market_sentiment)"""
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -140,6 +189,15 @@ def save_records(rows):
                         """,
                         (r["link"],)
                     )
+                for link in (skipped_links or []):
+                    cur.execute(
+                        """
+                        INSERT INTO processed_links (link_url)
+                        VALUES (%s)
+                        ON CONFLICT (link_url) DO NOTHING;
+                        """,
+                        (link,)
+                    )
             conn.commit()
     except Exception as e:
         print(f"Save to Neon error: {e}")
@@ -155,15 +213,18 @@ def fetch_feed_custom(url):
 
 
 def background_bot_worker():
-    print("=== Background Bot Active 24/7 (Neon-backed) ===")
+    print("=== Background Bot Active 24/7 (Neon-backed, Groq-screened) ===")
     client = genai.Client(api_key=GEMINI_API_KEY)
+    groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
     processed_links = load_processed_links()
     print(f"Loaded {len(processed_links)} previously processed links from Neon.")
 
     while True:
         try:
             new_records = []
+            skipped_links = []
             analyses_this_scan = 0
+            skipped_by_groq = 0
             quota_hit = False
             for source_name, url in RSS_FEEDS.items():
                 if quota_hit:
@@ -183,7 +244,15 @@ def background_bot_worker():
                     full_text = f"{title} {summary}"
 
                     if any(k.lower() in full_text.lower() for k in KEYWORDS):
+                        # ด่านแรก: ให้ Groq คัดว่าเป็น catalyst จริงไหม ก่อนจะเปลือง Gemini quota
+                        if groq_client and not screen_with_groq(groq_client, title):
+                            processed_links.add(link)  # ไม่ต้องกลับมาดูซ้ำ ไม่ใช่ catalyst
+                            skipped_links.append(link)
+                            skipped_by_groq += 1
+                            continue
+
                         asset_tag = detect_asset(full_text)
+                        lag_minutes = get_news_lag_minutes(entry)
                         res = analyze_advanced(client, title)
                         analyses_this_scan += 1
                         time.sleep(GEMINI_CALL_DELAY_SECONDS)  # กันยิงรัวจนชนโควตา
@@ -201,14 +270,16 @@ def background_bot_worker():
                         new_records.append(record)
                         processed_links.add(link)
 
-                        if record["confidence"] >= 65 and record["sentiment"] in ["Bullish", "Bearish"]:
+                        if record["confidence"] >= ALERT_CONFIDENCE_THRESHOLD and record["sentiment"] in ["Bullish", "Bearish"]:
                             send_telegram_alert(source_name, asset_tag, title, record["sentiment"],
-                                                 record["confidence"], record["action"], record["reason"], link)
+                                                 record["confidence"], record["action"], record["reason"], link,
+                                                 lag_minutes=lag_minutes)
 
-            if new_records:
-                save_records(new_records)
-                print(f"[{time.strftime('%H:%M:%S')}] Saved {len(new_records)} new items to Neon."
-                      + (" (capped this scan, more pending next round)" if quota_hit else ""))
+            if new_records or skipped_links:
+                save_records(new_records, skipped_links=skipped_links)
+                print(f"[{time.strftime('%H:%M:%S')}] Saved {len(new_records)} new items to Neon, "
+                      f"skipped {skipped_by_groq} non-catalyst items via Groq."
+                      + (" (Gemini cap hit, more pending next round)" if quota_hit else ""))
             else:
                 print(f"[{time.strftime('%H:%M:%S')}] Scan complete. No new items.")
         except Exception as e:
