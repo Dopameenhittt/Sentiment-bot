@@ -27,55 +27,55 @@ def _render_ui():
     # Auto refresh หน้าเว็บทุก 30 วินาทีอัตโนมัติ
     st_autorefresh(interval=30000, key="datarefresh")
 
-    # ---------- Custom Theme (light minimal look, softer palette) ----------
+    # ---------- Custom Theme (comfortable dark look) ----------
     st.markdown("""
     <style>
-        .stApp { background-color: #f6f5f3; }
+        .stApp { background-color: #14181f; }
         .main .block-container { padding-top: 1.5rem; max-width: 1400px; }
 
         .terminal-header {
             display: flex; justify-content: space-between; align-items: center;
             padding: 1.2rem 1.6rem; border-radius: 14px; margin-bottom: 1.2rem;
-            background: #fdfdfc;
-            border: 1px solid #e7e5e1;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+            background: #1b212b;
+            border: 1px solid #2b3340;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.2);
         }
-        .terminal-header h1 { margin: 0; font-size: 1.55rem; color: #2d2a26; }
-        .terminal-header p { margin: 0.2rem 0 0 0; color: #8a8579; font-size: 0.85rem; }
+        .terminal-header h1 { margin: 0; font-size: 1.55rem; color: #f1f3f6; }
+        .terminal-header p { margin: 0.2rem 0 0 0; color: #8b93a3; font-size: 0.85rem; }
         .live-badge {
             display: inline-flex; align-items: center; gap: 6px;
-            background: #eef6f0; color: #3f7d54;
+            background: rgba(52,199,120,0.14); color: #4ade80;
             padding: 5px 12px; border-radius: 20px; font-size: 0.8rem; font-weight: 600;
-            border: 1px solid #cfe6d6;
+            border: 1px solid rgba(74,222,128,0.35);
         }
         .live-dot {
-            width: 8px; height: 8px; border-radius: 50%; background: #4d9e68;
+            width: 8px; height: 8px; border-radius: 50%; background: #4ade80;
             animation: pulse 1.8s infinite;
         }
         @keyframes pulse {
-            0% { box-shadow: 0 0 0 0 rgba(77,158,104,0.45); }
-            70% { box-shadow: 0 0 0 8px rgba(77,158,104,0); }
-            100% { box-shadow: 0 0 0 0 rgba(77,158,104,0); }
+            0% { box-shadow: 0 0 0 0 rgba(74,222,128,0.5); }
+            70% { box-shadow: 0 0 0 8px rgba(74,222,128,0); }
+            100% { box-shadow: 0 0 0 0 rgba(74,222,128,0); }
         }
 
         div[data-testid="stMetric"] {
-            background: #fdfdfc; border: 1px solid #e7e5e1; border-radius: 12px;
-            padding: 0.9rem 1rem; box-shadow: 0 1px 2px rgba(0,0,0,0.02);
+            background: #1b212b; border: 1px solid #2b3340; border-radius: 12px;
+            padding: 0.9rem 1rem;
         }
-        div[data-testid="stMetricLabel"] { color: #8a8579; }
-        div[data-testid="stMetricValue"] { color: #2d2a26; }
+        div[data-testid="stMetricLabel"] { color: #8b93a3; }
+        div[data-testid="stMetricValue"] { color: #f1f3f6; }
 
         .sentiment-badge {
             padding: 3px 10px; border-radius: 20px; font-size: 0.78rem; font-weight: 700;
             display: inline-block;
         }
-        .badge-bull { background: #eef6f0; color: #3f7d54; }
-        .badge-bear { background: #fbeeec; color: #b3483c; }
-        .badge-neutral { background: #f1efec; color: #8a8579; }
+        .badge-bull { background: rgba(74,222,128,0.14); color: #4ade80; }
+        .badge-bear { background: rgba(248,113,113,0.14); color: #f87171; }
+        .badge-neutral { background: rgba(148,163,184,0.14); color: #94a3b8; }
 
-        section[data-testid="stSidebar"] { background: #fdfdfc; border-right: 1px solid #e7e5e1; }
-        h2, h3 { color: #2d2a26; }
-        .stTabs [data-baseweb="tab"] { color: #8a8579; }
+        section[data-testid="stSidebar"] { background: #1b212b; border-right: 1px solid #2b3340; }
+        h2, h3 { color: #f1f3f6; }
+        .stTabs [data-baseweb="tab"] { color: #8b93a3; }
         .stTabs [aria-selected="true"] { color: #2d2a26; }
     </style>
     """, unsafe_allow_html=True)
@@ -171,20 +171,20 @@ def _render_ui():
                 title={'text': "Market Sentiment Index"},
                 gauge={
                     'axis': {'range': [0, 100]},
-                    'bar': {'color': "#4a463f"},
+                    'bar': {'color': "#f1f3f6"},
                     'steps': [
-                        {'range': [0, 25], 'color': "#d98a80"},
-                        {'range': [25, 45], 'color': "#e0b483"},
-                        {'range': [45, 55], 'color': "#c9c5bd"},
-                        {'range': [55, 75], 'color': "#8fbf9f"},
-                        {'range': [75, 100], 'color': "#6fae82"}
+                        {'range': [0, 25], 'color': "#b91c1c"},
+                        {'range': [25, 45], 'color': "#c2703a"},
+                        {'range': [45, 55], 'color': "#475569"},
+                        {'range': [55, 75], 'color': "#2f855a"},
+                        {'range': [75, 100], 'color': "#22c55e"}
                     ],
                     'threshold': {'line': {'color': "black", 'width': 4}, 'thickness': 0.75, 'value': fear_greed_val}
                 }
             ))
             fig_gauge.update_layout(
                 height=350, margin=dict(l=20, r=20, t=50, b=20),
-                paper_bgcolor="rgba(0,0,0,0)", font_color="#4a463f"
+                paper_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0"
             )
             st.plotly_chart(fig_gauge, use_container_width=True)
 
@@ -194,12 +194,12 @@ def _render_ui():
                 df,
                 names="Sentiment",
                 color="Sentiment",
-                color_discrete_map={"Bullish": "#6fae82", "Bearish": "#c2685c", "Neutral": "#b3aea3"},
+                color_discrete_map={"Bullish": "#4ade80", "Bearish": "#f87171", "Neutral": "#94a3b8"},
                 hole=0.45,
             )
             fig_pie.update_layout(
                 height=350, margin=dict(l=20, r=20, t=50, b=20),
-                paper_bgcolor="rgba(0,0,0,0)", font_color="#4a463f"
+                paper_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0"
             )
             st.plotly_chart(fig_pie, use_container_width=True)
 
@@ -213,11 +213,11 @@ def _render_ui():
             )
             fig_bar = px.bar(
                 asset_summary, barmode="stack",
-                color_discrete_map={"Bullish": "#6fae82", "Bearish": "#c2685c", "Neutral": "#b3aea3"},
+                color_discrete_map={"Bullish": "#4ade80", "Bearish": "#f87171", "Neutral": "#94a3b8"},
             )
             fig_bar.update_layout(
                 height=320, margin=dict(l=20, r=20, t=30, b=20),
-                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#4a463f",
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0",
                 legend_title_text=""
             )
             st.plotly_chart(fig_bar, use_container_width=True)
@@ -254,4 +254,3 @@ def _render_ui():
         ⚠️ ระบบนี้มี lag จาก RSS โดยธรรมชาติ (นาทีถึงชั่วโมง) เหมาะสำหรับใช้เป็น**ข้อมูลประกอบการตัดสินใจ**
         ควบคู่กับระบบ technical indicator อื่น ไม่ควรใช้ตัดสินใจเข้า-ออกไม้เพียงลำพัง
         """)
-
