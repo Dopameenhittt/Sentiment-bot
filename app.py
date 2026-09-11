@@ -1,6 +1,7 @@
 import time
 import json
 import threading
+from datetime import datetime
 import feedparser
 import requests
 import streamlit as st
@@ -68,6 +69,63 @@ def detect_asset(text):
     return "General Market"
 
 
+# Binance เป็น public API ไม่ต้องขอ key ตอนนี้รองรับแค่ BTC/ETH (สินทรัพย์อื่นยังไม่มีราคาให้เทียบ)
+BINANCE_SYMBOLS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT"}
+
+
+def get_live_price(asset):
+    """คืนราคาปัจจุบันจาก Binance สำหรับสินทรัพย์ที่รองรับ คืน None ถ้าไม่มีราคาให้ดึง (เช่น FED, GOLD ตอนนี้)"""
+    symbol = BINANCE_SYMBOLS.get(asset)
+    if not symbol:
+        return None
+    try:
+        resp = requests.get(
+            "https://api.binance.com/api/v3/ticker/price",
+            params={"symbol": symbol}, timeout=10
+        )
+        resp.raise_for_status()
+        return float(resp.json()["price"])
+    except Exception as e:
+        print(f"Binance price fetch error ({asset}): {type(e).__name__}: {e}")
+        return None
+
+
+def update_pending_price_checks():
+    """เช็คว่าข่าวไหนถึงเวลาต้องบันทึกราคาหลังข่าวแล้วบ้าง (15นาที/1ชม./4ชม./24ชม.)
+    เพื่อใช้วัด accuracy จริงทีหลังว่าราคาขยับตามที่ทำนายไหม"""
+    windows = [
+        ("price_15m", "15 minutes"),
+        ("price_1h", "1 hour"),
+        ("price_4h", "4 hours"),
+        ("price_24h", "24 hours"),
+    ]
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                for column, interval in windows:
+                    cur.execute(
+                        f"""
+                        SELECT id, asset FROM market_sentiment
+                        WHERE price_at_alert IS NOT NULL
+                          AND {column} IS NULL
+                          AND timestamp <= NOW() - INTERVAL '{interval}'
+                        LIMIT 20;
+                        """
+                    )
+                    rows = cur.fetchall()
+                    for row_id, asset in rows:
+                        price = get_live_price(asset)
+                        if price is not None:
+                            cur.execute(
+                                f"UPDATE market_sentiment SET {column} = %s WHERE id = %s;",
+                                (price, row_id)
+                            )
+                            conn.commit()
+                        time.sleep(0.3)  # ใจดีกับ Binance API นิดหน่อย
+    except Exception as e:
+        print(f"Price check update error: {type(e).__name__}: {e}")
+
+
 def send_telegram_alert(source, asset, title, sentiment, confidence, action, reason, link, lag_minutes=None):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -120,6 +178,78 @@ def analyze_advanced(client, title):
         }
 
 
+def get_price_at(symbol, dt):
+    """ดึงราคาปิดของแท่งเทียน 1 นาทีที่ใกล้เวลา dt มากที่สุด (UTC) จาก Binance klines
+    (ราคาย้อนหลังจริง ต่างจาก get_live_price ที่ดึงแค่ราคาปัจจุบัน)"""
+    start_ms = int(dt.timestamp() * 1000)
+    try:
+        resp = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": symbol, "interval": "1m", "startTime": start_ms, "limit": 1},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
+            return None
+        return float(data[0][4])  # index 4 = close price ของแท่งเทียนนั้น
+    except Exception as e:
+        print(f"Binance historical price error: {type(e).__name__}: {e}")
+        return None
+
+
+def backfill_historical_prices():
+    """รันครั้งเดียวตอน bot เริ่มทำงาน: เติมราคาย้อนหลังให้ข่าว BTC/ETH เก่าที่ยังไม่มี price_at_alert
+    (ข่าวใหม่จากนี้ไป save_records()/update_pending_price_checks() จะเก็บราคาให้เองแบบ real-time)"""
+    from datetime import timedelta, timezone as tz
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, asset, timestamp FROM market_sentiment
+                    WHERE asset IN ('BTC', 'ETH') AND price_at_alert IS NULL
+                    ORDER BY timestamp ASC;
+                """)
+                rows = cur.fetchall()
+                if not rows:
+                    print("Backfill: ไม่มีข่าว BTC/ETH เก่าที่ต้องเติมราคาย้อนหลัง")
+                    return
+                print(f"Backfill: พบ {len(rows)} รายการ กำลังเติมราคาย้อนหลัง...")
+                now_utc = datetime.now(tz.utc)
+
+                for row_id, asset, ts in rows:
+                    symbol = BINANCE_SYMBOLS.get(asset)
+                    if not symbol:
+                        continue
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=tz.utc)
+
+                    windows = {
+                        "price_at_alert": ts,
+                        "price_15m": ts + timedelta(minutes=15),
+                        "price_1h": ts + timedelta(hours=1),
+                        "price_4h": ts + timedelta(hours=4),
+                        "price_24h": ts + timedelta(hours=24),
+                    }
+                    updates = {}
+                    for column, target_dt in windows.items():
+                        if target_dt > now_utc:
+                            continue  # ยังไม่ถึงเวลาจริง ปล่อยให้ update_pending_price_checks() เก็บทีหลัง
+                        price = get_price_at(symbol, target_dt)
+                        if price is not None:
+                            updates[column] = price
+                        time.sleep(0.3)  # ใจดีกับ Binance API
+
+                    if updates:
+                        set_clause = ", ".join(f"{c} = %s" for c in updates)
+                        values = list(updates.values()) + [row_id]
+                        cur.execute(f"UPDATE market_sentiment SET {set_clause} WHERE id = %s;", values)
+                        conn.commit()
+                print(f"Backfill: เติมราคาย้อนหลังเสร็จสิ้น {len(rows)} รายการ")
+    except Exception as e:
+        print(f"Backfill error: {type(e).__name__}: {e}")
+
+
 def load_processed_links():
     """โหลดลิงก์ที่เคยวิเคราะห์แล้วจาก Neon ตอน bot เริ่มทำงาน"""
     links = set()
@@ -141,15 +271,16 @@ def save_records(rows, skipped_links=None):
         with get_conn() as conn:
             with conn.cursor() as cur:
                 for r in rows:
+                    price_at_alert = get_live_price(r["asset"])
                     cur.execute(
                         """
                         INSERT INTO market_sentiment
-                            (link, source, asset, title, sentiment, confidence, action, reason)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            (link, source, asset, title, sentiment, confidence, action, reason, price_at_alert)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (link) DO NOTHING;
                         """,
                         (r["link"], r["source"], r["asset"], r["title"],
-                         r["sentiment"], r["confidence"], r["action"], r["reason"])
+                         r["sentiment"], r["confidence"], r["action"], r["reason"], price_at_alert)
                     )
                     cur.execute(
                         """
@@ -188,6 +319,7 @@ def background_bot_worker():
     groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
     processed_links = load_processed_links()
     print(f"Loaded {len(processed_links)} previously processed links from Neon.")
+    backfill_historical_prices()  # เติมราคาย้อนหลังให้ข่าว BTC/ETH เก่า (รันครั้งเดียวตอนเริ่ม)
 
     while True:
         try:
@@ -252,6 +384,8 @@ def background_bot_worker():
                       + (" (Gemini cap hit, more pending next round)" if quota_hit else ""))
             else:
                 print(f"[{time.strftime('%H:%M:%S')}] Scan complete. No new items.")
+
+            update_pending_price_checks()  # เช็คว่ามีข่าวไหนถึงเวลาบันทึกราคาหลังข่าวแล้วบ้าง
         except Exception as e:
             print(f"Worker Error: {e}")
 
