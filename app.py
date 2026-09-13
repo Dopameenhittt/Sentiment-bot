@@ -12,6 +12,7 @@ from config import (
     GEMINI_API_KEY, GROQ_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
     RSS_FEEDS, TARGET_ASSETS, KEYWORDS, INTERVAL_SECONDS,
     MAX_ANALYSES_PER_SCAN, GEMINI_CALL_DELAY_SECONDS, ALERT_CONFIDENCE_THRESHOLD,
+    COINGECKO_API_KEY,
     get_conn,
 )
 
@@ -74,18 +75,32 @@ def detect_asset(text):
 COINGECKO_IDS = {"BTC": "bitcoin", "ETH": "ethereum"}
 
 
+def _coingecko_get(url, params, max_retries=2):
+    """เรียก CoinGecko พร้อม API key (ถ้ามี) และ retry อัตโนมัติเมื่อโดน 429 rate limit"""
+    headers = {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY else {}
+    for attempt in range(max_retries + 1):
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        if resp.status_code == 429:
+            wait = 15 * (attempt + 1)  # 15s, 30s, ...
+            print(f"CoinGecko 429 rate limit, รอ {wait}s แล้วลองใหม่ (attempt {attempt + 1}/{max_retries})")
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp
+    resp.raise_for_status()  # หมด retry แล้วยัง 429 อยู่ ให้ raise ปกติ
+    return resp
+
+
 def get_live_price(asset):
     """คืนราคาปัจจุบันจาก CoinGecko สำหรับสินทรัพย์ที่รองรับ คืน None ถ้าไม่มีราคาให้ดึง (เช่น FED, GOLD ตอนนี้)"""
     coingecko_id = COINGECKO_IDS.get(asset)
     if not coingecko_id:
         return None
     try:
-        resp = requests.get(
+        resp = _coingecko_get(
             "https://api.coingecko.com/api/v3/simple/price",
             params={"ids": coingecko_id, "vs_currencies": "usd"},
-            timeout=10,
         )
-        resp.raise_for_status()
         return float(resp.json()[coingecko_id]["usd"])
     except Exception as e:
         print(f"CoinGecko price fetch error ({asset}): {type(e).__name__}: {e}")
@@ -187,12 +202,10 @@ def get_price_at(coingecko_id, dt):
     from_ts = int((dt - _td(minutes=30)).timestamp())
     to_ts = int((dt + _td(minutes=30)).timestamp())
     try:
-        resp = requests.get(
+        resp = _coingecko_get(
             f"https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart/range",
             params={"vs_currency": "usd", "from": from_ts, "to": to_ts},
-            timeout=10,
         )
-        resp.raise_for_status()
         prices = resp.json().get("prices", [])
         if not prices:
             return None
@@ -250,7 +263,7 @@ def backfill_historical_prices():
             price = get_price_at(coingecko_id, target_dt)
             if price is not None:
                 updates[column] = price
-            time.sleep(1.5)  # ใจดีกับ rate limit ของ CoinGecko free tier
+            time.sleep(2.5)  # ใจดีกับ rate limit ของ CoinGecko free tier (มี retry รองรับ 429 อยู่แล้ว)
 
         if updates:
             try:
