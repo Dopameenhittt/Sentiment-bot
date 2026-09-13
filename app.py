@@ -69,24 +69,26 @@ def detect_asset(text):
     return "General Market"
 
 
-# Binance เป็น public API ไม่ต้องขอ key ตอนนี้รองรับแค่ BTC/ETH (สินทรัพย์อื่นยังไม่มีราคาให้เทียบ)
-BINANCE_SYMBOLS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT"}
+# CoinGecko เป็น public API ไม่ต้องขอ key และไม่โดนบล็อกตามภูมิภาคแบบ Binance
+# ตอนนี้รองรับแค่ BTC/ETH (สินทรัพย์อื่นยังไม่มีราคาให้เทียบ)
+COINGECKO_IDS = {"BTC": "bitcoin", "ETH": "ethereum"}
 
 
 def get_live_price(asset):
-    """คืนราคาปัจจุบันจาก Binance สำหรับสินทรัพย์ที่รองรับ คืน None ถ้าไม่มีราคาให้ดึง (เช่น FED, GOLD ตอนนี้)"""
-    symbol = BINANCE_SYMBOLS.get(asset)
-    if not symbol:
+    """คืนราคาปัจจุบันจาก CoinGecko สำหรับสินทรัพย์ที่รองรับ คืน None ถ้าไม่มีราคาให้ดึง (เช่น FED, GOLD ตอนนี้)"""
+    coingecko_id = COINGECKO_IDS.get(asset)
+    if not coingecko_id:
         return None
     try:
         resp = requests.get(
-            "https://api.binance.com/api/v3/ticker/price",
-            params={"symbol": symbol}, timeout=10
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": coingecko_id, "vs_currencies": "usd"},
+            timeout=10,
         )
         resp.raise_for_status()
-        return float(resp.json()["price"])
+        return float(resp.json()[coingecko_id]["usd"])
     except Exception as e:
-        print(f"Binance price fetch error ({asset}): {type(e).__name__}: {e}")
+        print(f"CoinGecko price fetch error ({asset}): {type(e).__name__}: {e}")
         return None
 
 
@@ -178,29 +180,34 @@ def analyze_advanced(client, title):
         }
 
 
-def get_price_at(symbol, dt):
-    """ดึงราคาปิดของแท่งเทียน 1 นาทีที่ใกล้เวลา dt มากที่สุด (UTC) จาก Binance klines
-    (ราคาย้อนหลังจริง ต่างจาก get_live_price ที่ดึงแค่ราคาปัจจุบัน)"""
-    start_ms = int(dt.timestamp() * 1000)
+def get_price_at(coingecko_id, dt):
+    """ดึงราคา ณ เวลา dt (UTC) จาก CoinGecko โดยขอช่วงแคบๆ รอบเวลานั้น (±30 นาที)
+    แล้วเลือกจุดข้อมูลที่ใกล้เวลาเป้าหมายที่สุด (ราคาย้อนหลังจริง ต่างจาก get_live_price ที่ดึงราคาปัจจุบัน)"""
+    from datetime import timedelta as _td
+    from_ts = int((dt - _td(minutes=30)).timestamp())
+    to_ts = int((dt + _td(minutes=30)).timestamp())
     try:
         resp = requests.get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol": symbol, "interval": "1m", "startTime": start_ms, "limit": 1},
+            f"https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart/range",
+            params={"vs_currency": "usd", "from": from_ts, "to": to_ts},
             timeout=10,
         )
         resp.raise_for_status()
-        data = resp.json()
-        if not data:
+        prices = resp.json().get("prices", [])
+        if not prices:
             return None
-        return float(data[0][4])  # index 4 = close price ของแท่งเทียนนั้น
+        target_ms = dt.timestamp() * 1000
+        closest = min(prices, key=lambda p: abs(p[0] - target_ms))
+        return float(closest[1])
     except Exception as e:
-        print(f"Binance historical price error: {type(e).__name__}: {e}")
+        print(f"CoinGecko historical price error: {type(e).__name__}: {e}")
         return None
 
 
 def backfill_historical_prices():
     """รันครั้งเดียวตอน bot เริ่มทำงาน: เติมราคาย้อนหลังให้ข่าว BTC/ETH เก่าที่ยังไม่มี price_at_alert
-    (ข่าวใหม่จากนี้ไป save_records()/update_pending_price_checks() จะเก็บราคาให้เองแบบ real-time)"""
+    (ข่าวใหม่จากนี้ไป save_records()/update_pending_price_checks() จะเก็บราคาให้เองแบบ real-time)
+    เปิด connection ใหม่ทุกแถวที่บันทึก กันปัญหา connection หลุดตอนรันนาน (เจอ SSL closed มาก่อน)"""
     from datetime import timedelta, timezone as tz
     try:
         with get_conn() as conn:
@@ -211,43 +218,53 @@ def backfill_historical_prices():
                     ORDER BY timestamp ASC;
                 """)
                 rows = cur.fetchall()
-                if not rows:
-                    print("Backfill: ไม่มีข่าว BTC/ETH เก่าที่ต้องเติมราคาย้อนหลัง")
-                    return
-                print(f"Backfill: พบ {len(rows)} รายการ กำลังเติมราคาย้อนหลัง...")
-                now_utc = datetime.now(tz.utc)
+    except Exception as e:
+        print(f"Backfill error (reading rows): {type(e).__name__}: {e}")
+        return
 
-                for row_id, asset, ts in rows:
-                    symbol = BINANCE_SYMBOLS.get(asset)
-                    if not symbol:
-                        continue
-                    if ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=tz.utc)
+    if not rows:
+        print("Backfill: ไม่มีข่าว BTC/ETH เก่าที่ต้องเติมราคาย้อนหลัง")
+        return
+    print(f"Backfill: พบ {len(rows)} รายการ กำลังเติมราคาย้อนหลัง...")
+    now_utc = datetime.now(tz.utc)
+    done = 0
 
-                    windows = {
-                        "price_at_alert": ts,
-                        "price_15m": ts + timedelta(minutes=15),
-                        "price_1h": ts + timedelta(hours=1),
-                        "price_4h": ts + timedelta(hours=4),
-                        "price_24h": ts + timedelta(hours=24),
-                    }
-                    updates = {}
-                    for column, target_dt in windows.items():
-                        if target_dt > now_utc:
-                            continue  # ยังไม่ถึงเวลาจริง ปล่อยให้ update_pending_price_checks() เก็บทีหลัง
-                        price = get_price_at(symbol, target_dt)
-                        if price is not None:
-                            updates[column] = price
-                        time.sleep(0.3)  # ใจดีกับ Binance API
+    for row_id, asset, ts in rows:
+        coingecko_id = COINGECKO_IDS.get(asset)
+        if not coingecko_id:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=tz.utc)
 
-                    if updates:
+        windows = {
+            "price_at_alert": ts,
+            "price_15m": ts + timedelta(minutes=15),
+            "price_1h": ts + timedelta(hours=1),
+            "price_4h": ts + timedelta(hours=4),
+            "price_24h": ts + timedelta(hours=24),
+        }
+        updates = {}
+        for column, target_dt in windows.items():
+            if target_dt > now_utc:
+                continue  # ยังไม่ถึงเวลาจริง ปล่อยให้ update_pending_price_checks() เก็บทีหลัง
+            price = get_price_at(coingecko_id, target_dt)
+            if price is not None:
+                updates[column] = price
+            time.sleep(1.5)  # ใจดีกับ rate limit ของ CoinGecko free tier
+
+        if updates:
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
                         set_clause = ", ".join(f"{c} = %s" for c in updates)
                         values = list(updates.values()) + [row_id]
                         cur.execute(f"UPDATE market_sentiment SET {set_clause} WHERE id = %s;", values)
-                        conn.commit()
-                print(f"Backfill: เติมราคาย้อนหลังเสร็จสิ้น {len(rows)} รายการ")
-    except Exception as e:
-        print(f"Backfill error: {type(e).__name__}: {e}")
+                    conn.commit()
+                done += 1
+            except Exception as e:
+                print(f"Backfill row {row_id} save error: {type(e).__name__}: {e}")
+
+    print(f"Backfill: เติมราคาย้อนหลังเสร็จสิ้น {done}/{len(rows)} รายการ")
 
 
 def load_processed_links():
