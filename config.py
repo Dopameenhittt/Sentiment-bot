@@ -17,6 +17,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "").strip()
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set. Add it in Render > Environment.")
