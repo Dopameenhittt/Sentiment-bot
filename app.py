@@ -280,6 +280,87 @@ def backfill_historical_prices():
     print(f"Backfill: เติมราคาย้อนหลังเสร็จสิ้น {done}/{len(rows)} รายการ")
 
 
+def backfill_baseline_prices():
+    """เติม baseline sample ย้อนหลัง โดยสุ่มจุดเวลาแบบสม่ำเสมอ (ทุก 6 ชม.) ตั้งแต่ข่าวแรกในระบบจนถึงตอนนี้
+    ใช้ get_price_at() แบบเดียวกับที่ backfill_historical_prices() ใช้เติมราคาข่าวเก่า
+    เพื่อให้มีข้อมูล baseline เทียบกับข่าวได้ทันที ไม่ต้องรอสะสมทีละ 15 นาทีจากนี้ไปเรื่อยๆ
+    รันครั้งเดียวตอน bot เริ่ม และข้ามอัตโนมัติถ้ามี baseline sample อยู่แล้ว (กันเติมซ้ำทุกรอบ restart)"""
+    from datetime import timedelta, timezone as tz
+    SAMPLE_INTERVAL_HOURS = 6
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT MIN(timestamp) FROM market_sentiment WHERE asset IN ('BTC', 'ETH');")
+                earliest = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM baseline_prices;")
+                existing_count = cur.fetchone()[0]
+    except Exception as e:
+        print(f"Baseline backfill error (reading range): {type(e).__name__}: {e}")
+        return
+
+    if not earliest:
+        print("Baseline backfill: ยังไม่มีข่าว BTC/ETH ในระบบ ข้ามการเติมย้อนหลัง")
+        return
+    if existing_count > 0:
+        print(f"Baseline backfill: มี baseline sample อยู่แล้ว {existing_count} รายการ ข้ามการเติมย้อนหลัง (กันซ้ำ)")
+        return
+
+    if earliest.tzinfo is None:
+        earliest = earliest.replace(tzinfo=tz.utc)
+    now_utc = datetime.now(tz.utc)
+
+    sample_times = []
+    t = earliest
+    while t <= now_utc:
+        sample_times.append(t)
+        t += timedelta(hours=SAMPLE_INTERVAL_HOURS)
+
+    print(f"Baseline backfill: จะเติม {len(sample_times)} จุดเวลา x 2 สินทรัพย์ (BTC/ETH) "
+          f"ย้อนหลังตั้งแต่ {earliest.isoformat()} ถึงตอนนี้ (ทุก {SAMPLE_INTERVAL_HOURS} ชม.) "
+          f"— ใช้เวลาสักพัก เพราะต้องเรียก CoinGecko หลายร้อยครั้ง")
+
+    done = 0
+    for sample_dt in sample_times:
+        for asset, coingecko_id in COINGECKO_IDS.items():
+            price_now = get_price_at(coingecko_id, sample_dt)
+            time.sleep(1.5)
+            if price_now is None:
+                continue
+
+            windows = {
+                "price_15m": sample_dt + timedelta(minutes=15),
+                "price_1h": sample_dt + timedelta(hours=1),
+                "price_4h": sample_dt + timedelta(hours=4),
+                "price_24h": sample_dt + timedelta(hours=24),
+            }
+            updates = {}
+            for column, target_dt in windows.items():
+                if target_dt > now_utc:
+                    continue
+                price = get_price_at(coingecko_id, target_dt)
+                if price is not None:
+                    updates[column] = price
+                time.sleep(1.5)
+
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cols = ["asset", "sampled_at", "price_now"] + list(updates.keys())
+                        vals = [asset, sample_dt, price_now] + list(updates.values())
+                        placeholders = ", ".join(["%s"] * len(vals))
+                        cur.execute(
+                            f"INSERT INTO baseline_prices ({', '.join(cols)}) VALUES ({placeholders});",
+                            vals
+                        )
+                    conn.commit()
+                done += 1
+            except Exception as e:
+                print(f"Baseline backfill save error ({asset} @ {sample_dt.isoformat()}): {type(e).__name__}: {e}")
+
+    print(f"Baseline backfill: เติมย้อนหลังเสร็จสิ้น {done}/{len(sample_times) * len(COINGECKO_IDS)} รายการ")
+
+
 def sample_baseline_price():
     """สุ่มเก็บราคาปัจจุบันของ BTC/ETH แบบไม่อิงข่าว (baseline) เพื่อไว้เทียบว่าตอนมีข่าว
     ราคาขยับ 'มากผิดปกติ' กว่าตอนไม่มีข่าวจริงไหม (วัด market impact ไม่ใช่แค่ทิศทาง)"""
@@ -405,6 +486,7 @@ def background_bot_worker():
     processed_links = load_processed_links()
     print(f"Loaded {len(processed_links)} previously processed links from Neon.")
     backfill_historical_prices()  # เติมราคาย้อนหลังให้ข่าว BTC/ETH เก่า (รันครั้งเดียวตอนเริ่ม)
+    backfill_baseline_prices()  # เติม baseline sample ย้อนหลัง (รันครั้งเดียว ใช้เทียบกับข่าวได้ทันที ไม่ต้องรอสะสมใหม่)
 
     scan_count = 0
     # สุ่มเก็บ baseline price ทุกๆ BASELINE_SAMPLE_EVERY รอบ (รอบละ INTERVAL_SECONDS วิ)
