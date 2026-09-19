@@ -1,5 +1,6 @@
 import time
 import json
+import re
 import threading
 from datetime import datetime
 import feedparser
@@ -167,15 +168,48 @@ def send_telegram_alert(source, asset, title, sentiment, confidence, action, rea
         print(f"Telegram Error: {e}")
 
 
-def analyze_advanced(client, title):
+def _clean_summary(summary, max_len=600):
+    """ตัด HTML tag ออกจาก RSS summary/body และจำกัดความยาว ก่อนส่งให้ Gemini วิเคราะห์
+    (RSS summary มักมี <a>, <img>, <p> ปนมา ถ้าไม่ตัดออกจะกินโควตา token และรก prompt เปล่าๆ)"""
+    text = re.sub(r"<[^>]+>", " ", summary or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_len]
+
+
+def analyze_advanced(client, title, summary="", asset=""):
+    """วิเคราะห์ sentiment โดยใช้ทั้ง title และ summary/body ของข่าว (ไม่ใช่แค่ title เฉยๆ เหมือนเดิม)
+    และให้เกณฑ์ confidence ที่ชัดเจนขึ้น เพื่อให้ค่าที่ได้สะท้อนโอกาสราคาขยับจริง
+    ไม่ใช่แค่ 'โทนข่าวฟังดูมั่นใจแค่ไหน' (ปัญหาที่พบจากการ backtest: confidence สูงกลับแม่นน้อยกว่า confidence ต่ำ)"""
+    clean_summary = _clean_summary(summary)
+    body_block = f'\n    Body/summary: "{clean_summary}"' if clean_summary else ""
+    asset_block = f"\n    Asset in focus: {asset}" if asset and asset != "General Market" else ""
+
     prompt = f"""
-    Analyze the financial market sentiment of this title: "{title}"
+    You are a professional market analyst screening news for SHORT-TERM (minutes-to-hours) trading signals.
+
+    Headline: "{title}"{body_block}{asset_block}
+
+    Analyze the market sentiment based on the FULL content above (headline AND body, not just the headline).
+
+    Confidence scoring guide — confidence must reflect how likely the price is to actually move in the
+    stated direction within the next few hours, NOT how strongly-worded or dramatic the headline sounds:
+    - 85-100: A concrete, already-confirmed event with a clear, direct causal link to price
+      (e.g. an actual rate decision, a confirmed hack/exploit with a specific dollar amount,
+      a confirmed regulatory ruling, an earnings beat/miss with hard numbers).
+    - 60-84: A real potential catalyst, but with meaningful uncertainty — a forecast, a rumor,
+      an analyst opinion, or an event whose market impact is plausible but not yet confirmed.
+    - Below 60: Vague, speculative, opinion/editorial content, or news that is likely already
+      priced in / stale / recycled.
+    If the headline is clickbait, an opinion piece, a repeated/stale story, or has no clear causal
+    link to near-term price movement, sentiment should be "Neutral" and confidence should be LOW
+    regardless of how dramatic the wording is.
+
     Respond strictly in JSON format with these exact keys:
     {{
         "sentiment": "Bullish" or "Bearish" or "Neutral",
         "confidence": 80,
         "action": "Buy Call/Long" or "Buy Put/Short" or "Wait and See",
-        "reason": "1 short concise sentence explaining why"
+        "reason": "1 short concise sentence explaining why, citing the body content if it added information"
     }}
     """
     try:
@@ -531,7 +565,7 @@ def background_bot_worker():
 
                         asset_tag = detect_asset(full_text)
                         lag_minutes = get_news_lag_minutes(entry)
-                        res = analyze_advanced(client, title)
+                        res = analyze_advanced(client, title, summary, asset_tag)
                         analyses_this_scan += 1
                         time.sleep(GEMINI_CALL_DELAY_SECONDS)  # กันยิงรัวจนชนโควตา
 
