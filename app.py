@@ -450,6 +450,86 @@ def update_pending_baseline_checks():
         print(f"Baseline price check update error: {type(e).__name__}: {e}")
 
 
+def run_prompt_backtest_once(client):
+    """เทส prompt ใหม่กับข่าวเก่าที่รู้ผลจริงแล้ว (มี price_4h) โดยเฉพาะกลุ่มที่ prompt เก่าพลาด:
+    - confidence สูง (>=80) แต่ทายผิด
+    - confidence ต่ำ (<80) แต่ทายถูก
+    (เป็นกลุ่มที่ตรงประเด็นที่สุดว่า prompt ใหม่แก้ปัญหา confidence ไม่สัมพันธ์กับความแม่นยำได้จริงไหม)
+    รันครั้งเดียวเท่านั้น (เช็คจาก prompt_backtest_results) เพื่อประหยัดโควตา Gemini ที่มีจำกัดมาก
+    บันทึกผลเทียบเก่า-ใหม่ลง Neon ดูผลได้ผ่าน query หรือถาม Claude ทีหลัง"""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM prompt_backtest_results;")
+                if cur.fetchone()[0] > 0:
+                    print("Prompt backtest: เคยรันไปแล้ว ข้าม (กันเปลืองโควตา Gemini)")
+                    return
+
+                cur.execute("""
+                    SELECT link, asset, title, sentiment, confidence,
+                           (sentiment = 'Bullish') = (price_4h > price_at_alert) AS was_correct
+                    FROM market_sentiment
+                    WHERE asset IN ('BTC','ETH') AND sentiment IN ('Bullish','Bearish')
+                      AND price_at_alert IS NOT NULL AND price_4h IS NOT NULL
+                      AND price_4h <> price_at_alert AND confidence >= 80
+                      AND (sentiment = 'Bullish') != (price_4h > price_at_alert)
+                    ORDER BY confidence DESC LIMIT 3;
+                """)
+                high_conf_wrong = cur.fetchall()
+
+                cur.execute("""
+                    SELECT link, asset, title, sentiment, confidence,
+                           (sentiment = 'Bullish') = (price_4h > price_at_alert) AS was_correct
+                    FROM market_sentiment
+                    WHERE asset IN ('BTC','ETH') AND sentiment IN ('Bullish','Bearish')
+                      AND price_at_alert IS NOT NULL AND price_4h IS NOT NULL
+                      AND price_4h <> price_at_alert AND confidence < 80
+                      AND (sentiment = 'Bullish') = (price_4h > price_at_alert)
+                    ORDER BY confidence ASC LIMIT 3;
+                """)
+                low_conf_right = cur.fetchall()
+
+        candidates = list(high_conf_wrong) + list(low_conf_right)
+        if not candidates:
+            print("Prompt backtest: ไม่พบข่าวเก่าที่เข้าเงื่อนไขให้เทส ข้าม")
+            return
+
+        print(f"Prompt backtest: กำลังเทส prompt ใหม่กับข่าวเก่า {len(candidates)} รายการ (title เท่านั้น ไม่มี body เก่าเก็บไว้)")
+        for link, asset, title, old_sentiment, old_confidence, old_correct in candidates:
+            res = analyze_advanced(client, title, "", asset)
+            time.sleep(GEMINI_CALL_DELAY_SECONDS)
+            new_sentiment = res.get("sentiment", "Neutral")
+            new_confidence = res.get("confidence", 50)
+            new_reason = res.get("reason", "-")
+
+            # ใช้ actual_up จากข้อมูลเดิม (คำนวณซ้ำจาก was_correct + old_sentiment เพื่อไม่ต้อง query อีกรอบ)
+            actual_up = (old_sentiment == "Bullish") == old_correct
+            new_correct = None
+            if new_sentiment in ("Bullish", "Bearish"):
+                new_correct = (new_sentiment == "Bullish") == actual_up
+
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO prompt_backtest_results
+                                (link, asset, title, old_sentiment, old_confidence, old_correct,
+                                 new_sentiment, new_confidence, new_correct, new_reason)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                            """,
+                            (link, asset, title, old_sentiment, old_confidence, old_correct,
+                             new_sentiment, new_confidence, new_correct, new_reason)
+                        )
+                    conn.commit()
+            except Exception as e:
+                print(f"Prompt backtest save error: {type(e).__name__}: {e}")
+
+        print(f"Prompt backtest: เทสเสร็จสิ้น {len(candidates)} รายการ ดูผลได้จากตาราง prompt_backtest_results")
+    except Exception as e:
+        print(f"Prompt backtest error: {type(e).__name__}: {e}")
+
+
 def load_processed_links():
     """โหลดลิงก์ที่เคยวิเคราะห์แล้วจาก Neon ตอน bot เริ่มทำงาน"""
     links = set()
@@ -521,6 +601,7 @@ def background_bot_worker():
     print(f"Loaded {len(processed_links)} previously processed links from Neon.")
     backfill_historical_prices()  # เติมราคาย้อนหลังให้ข่าว BTC/ETH เก่า (รันครั้งเดียวตอนเริ่ม)
     backfill_baseline_prices()  # เติม baseline sample ย้อนหลัง (รันครั้งเดียว ใช้เทียบกับข่าวได้ทันที ไม่ต้องรอสะสมใหม่)
+    run_prompt_backtest_once(client)  # เทส prompt ใหม่กับข่าวเก่าที่รู้ผลจริงแล้ว (รันครั้งเดียว)
 
     scan_count = 0
     # สุ่มเก็บ baseline price ทุกๆ BASELINE_SAMPLE_EVERY รอบ (รอบละ INTERVAL_SECONDS วิ)
