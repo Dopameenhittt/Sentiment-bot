@@ -280,6 +280,61 @@ def backfill_historical_prices():
     print(f"Backfill: เติมราคาย้อนหลังเสร็จสิ้น {done}/{len(rows)} รายการ")
 
 
+def sample_baseline_price():
+    """สุ่มเก็บราคาปัจจุบันของ BTC/ETH แบบไม่อิงข่าว (baseline) เพื่อไว้เทียบว่าตอนมีข่าว
+    ราคาขยับ 'มากผิดปกติ' กว่าตอนไม่มีข่าวจริงไหม (วัด market impact ไม่ใช่แค่ทิศทาง)"""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                for asset in COINGECKO_IDS:
+                    price = get_live_price(asset)
+                    if price is not None:
+                        cur.execute(
+                            "INSERT INTO baseline_prices (asset, price_now) VALUES (%s, %s);",
+                            (asset, price)
+                        )
+                    time.sleep(0.3)
+            conn.commit()
+    except Exception as e:
+        print(f"Baseline sample error: {type(e).__name__}: {e}")
+
+
+def update_pending_baseline_checks():
+    """เติมราคา 15นาที/1ชม./4ชม./24ชม. ให้ baseline sample ที่ถึงเวลาแล้ว
+    (โครงเดียวกับ update_pending_price_checks() แต่ใช้กับตาราง baseline_prices)"""
+    windows = [
+        ("price_15m", "15 minutes"),
+        ("price_1h", "1 hour"),
+        ("price_4h", "4 hours"),
+        ("price_24h", "24 hours"),
+    ]
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                for column, interval in windows:
+                    cur.execute(
+                        f"""
+                        SELECT id, asset FROM baseline_prices
+                        WHERE price_now IS NOT NULL
+                          AND {column} IS NULL
+                          AND sampled_at <= NOW() - INTERVAL '{interval}'
+                        LIMIT 20;
+                        """
+                    )
+                    rows = cur.fetchall()
+                    for row_id, asset in rows:
+                        price = get_live_price(asset)
+                        if price is not None:
+                            cur.execute(
+                                f"UPDATE baseline_prices SET {column} = %s WHERE id = %s;",
+                                (price, row_id)
+                            )
+                            conn.commit()
+                        time.sleep(0.3)
+    except Exception as e:
+        print(f"Baseline price check update error: {type(e).__name__}: {e}")
+
+
 def load_processed_links():
     """โหลดลิงก์ที่เคยวิเคราะห์แล้วจาก Neon ตอน bot เริ่มทำงาน"""
     links = set()
@@ -351,8 +406,17 @@ def background_bot_worker():
     print(f"Loaded {len(processed_links)} previously processed links from Neon.")
     backfill_historical_prices()  # เติมราคาย้อนหลังให้ข่าว BTC/ETH เก่า (รันครั้งเดียวตอนเริ่ม)
 
+    scan_count = 0
+    # สุ่มเก็บ baseline price ทุกๆ BASELINE_SAMPLE_EVERY รอบ (รอบละ INTERVAL_SECONDS วิ)
+    # ค่าเริ่มต้น 5 รอบ x 180 วิ = ทุก 15 นาที ให้ความถี่ใกล้เคียงกับ window ที่ใช้วัด impact (15m)
+    BASELINE_SAMPLE_EVERY = 5
+
     while True:
         try:
+            scan_count += 1
+            if scan_count % BASELINE_SAMPLE_EVERY == 0:
+                sample_baseline_price()
+
             new_records = []
             skipped_links = []
             analyses_this_scan = 0
@@ -416,6 +480,7 @@ def background_bot_worker():
                 print(f"[{time.strftime('%H:%M:%S')}] Scan complete. No new items.")
 
             update_pending_price_checks()  # เช็คว่ามีข่าวไหนถึงเวลาบันทึกราคาหลังข่าวแล้วบ้าง
+            update_pending_baseline_checks()  # เช็ค baseline sample ที่ถึงเวลาบันทึกราคาด้วยเหมือนกัน
         except Exception as e:
             print(f"Worker Error: {e}")
 

@@ -104,6 +104,83 @@ def _render_ui():
             return pd.DataFrame()
 
 
+    @st.cache_data(ttl=60)
+    def load_impact_data():
+        """ดึงข้อมูลราคาของข่าว (market_sentiment) และ baseline (ไม่อิงข่าว) มาเทียบกัน
+        เพื่อตอบ 2 คำถาม: (1) ข่าวทำให้ราคาขยับมากกว่าปกติจริงไหม (2) ทิศทางที่ AI ทำนายถูกไหม"""
+        try:
+            with get_conn() as conn:
+                news_df = pd.read_sql(
+                    """
+                    SELECT asset AS "Asset", sentiment AS "Sentiment",
+                           price_at_alert AS "P0", price_15m AS "P15m",
+                           price_1h AS "P1h", price_4h AS "P4h", price_24h AS "P24h"
+                    FROM market_sentiment
+                    WHERE asset IN ('BTC', 'ETH') AND price_at_alert IS NOT NULL;
+                    """,
+                    conn
+                )
+                baseline_df = pd.read_sql(
+                    """
+                    SELECT asset AS "Asset",
+                           price_now AS "P0", price_15m AS "P15m",
+                           price_1h AS "P1h", price_4h AS "P4h", price_24h AS "P24h"
+                    FROM baseline_prices
+                    WHERE price_now IS NOT NULL;
+                    """,
+                    conn
+                )
+            return news_df, baseline_df
+        except Exception as e:
+            st.error(f"Error loading impact data from Neon: {e}")
+            return pd.DataFrame(), pd.DataFrame()
+
+
+    def _compute_impact_stats(news_df, baseline_df):
+        """คำนวณ: ขนาดการขยับราคาเฉลี่ย (impact) ของข่าว vs baseline, และ directional accuracy
+        ต่อ window เวลา (15m/1h/4h/24h) — ตัด row ที่ราคาเท่าเดิมทุกเป๊ะออก (มักเกิดจาก backfill
+        ที่มีความละเอียดหยาบ ไม่ใช่ราคาไม่ขยับจริง) เพื่อไม่ให้ค่าความแม่นยำเพี้ยน"""
+        windows = [("15m", "P15m"), ("1h", "P1h"), ("4h", "P4h"), ("24h", "P24h")]
+        rows = []
+        for label, col in windows:
+            # --- Market impact: news vs baseline ---
+            n = news_df.dropna(subset=["P0", col]).copy()
+            n = n[n["P0"] != n[col]]
+            news_move = ((n[col] - n["P0"]).abs() / n["P0"] * 100)
+            news_avg_move = round(news_move.mean(), 3) if len(news_move) > 0 else None
+            news_n = len(news_move)
+
+            b = baseline_df.dropna(subset=["P0", col]).copy()
+            b = b[b["P0"] != b[col]]
+            base_move = ((b[col] - b["P0"]).abs() / b["P0"] * 100)
+            base_avg_move = round(base_move.mean(), 3) if len(base_move) > 0 else None
+            base_n = len(base_move)
+
+            # --- Directional accuracy: ทิศทางที่ AI ทำนาย (Bullish/Bearish) ตรงกับราคาจริงไหม ---
+            d = n[n["Sentiment"].isin(["Bullish", "Bearish"])].copy()
+            if len(d) > 0:
+                actual_up = d[col] > d["P0"]
+                predicted_up = d["Sentiment"] == "Bullish"
+                correct = (actual_up == predicted_up)
+                accuracy = round(correct.mean() * 100, 1)
+                acc_n = len(d)
+            else:
+                accuracy = None
+                acc_n = 0
+
+            rows.append({
+                "Window": label,
+                "News Avg Move %": news_avg_move,
+                "News N": news_n,
+                "Baseline Avg Move %": base_avg_move,
+                "Baseline N": base_n,
+                "Impact Ratio": round(news_avg_move / base_avg_move, 2) if news_avg_move and base_avg_move else None,
+                "Direction Accuracy %": accuracy,
+                "Accuracy N": acc_n,
+            })
+        return pd.DataFrame(rows)
+
+
     df = load_dashboard_data()
 
     # ---------- Header with live status badge ----------
@@ -158,7 +235,9 @@ def _render_ui():
     c4.metric("Neutral ⚪", neutral_count)
     c5.metric("Index Score", f"{fear_greed_val}/100")
 
-    tab_overview, tab_news, tab_about = st.tabs(["📊 Overview", "📰 News Feed", "ℹ️ About"])
+    tab_overview, tab_news, tab_impact, tab_about = st.tabs(
+        ["📊 Overview", "📰 News Feed", "📐 Market Impact", "ℹ️ About"]
+    )
 
     with tab_overview:
         col_gauge, col_pie = st.columns([1, 1])
@@ -242,6 +321,83 @@ def _render_ui():
             hide_index=True,
         )
 
+    with tab_impact:
+        st.subheader("📐 ข่าวมีผลต่อตลาดจริงไหม? ทิศทางที่ทำนายถูกไหม?")
+        st.caption(
+            "เทียบขนาดการขยับราคาหลังข่าว (BTC/ETH) กับช่วงที่ไม่มีข่าว (baseline) "
+            "เพื่อดูว่าข่าวทำให้ราคาขยับ 'แรงกว่าปกติ' จริงไหม พร้อมเช็คว่า AI ทำนายทิศทางถูกกี่ %"
+        )
+
+        news_df, baseline_df = load_impact_data()
+
+        if news_df.empty:
+            st.info("ยังไม่มีข้อมูลราคาข่าว BTC/ETH ที่ backfill/track เสร็จพอจะวิเคราะห์")
+        elif baseline_df.empty:
+            st.info(
+                "ยังไม่มีข้อมูล baseline (ราคาที่เก็บแบบไม่อิงข่าว) เพียงพอ — "
+                "ระบบเริ่มเก็บ baseline อัตโนมัติทุก ~15 นาทีแล้ว รอสักพักแล้วกลับมาดูใหม่"
+            )
+        else:
+            stats_df = _compute_impact_stats(news_df, baseline_df)
+
+            col_a, col_b = st.columns([1.3, 1])
+
+            with col_a:
+                st.markdown("**ขนาดการขยับราคาเฉลี่ย (Market Impact)**")
+                fig_impact = go.Figure()
+                fig_impact.add_bar(
+                    name="ตอนมีข่าว", x=stats_df["Window"], y=stats_df["News Avg Move %"],
+                    marker_color="#4ade80"
+                )
+                fig_impact.add_bar(
+                    name="Baseline (ไม่มีข่าว)", x=stats_df["Window"], y=stats_df["Baseline Avg Move %"],
+                    marker_color="#94a3b8"
+                )
+                fig_impact.update_layout(
+                    barmode="group", height=330, margin=dict(l=20, r=20, t=20, b=20),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0",
+                    yaxis_title="Avg |% price move|", legend_title_text=""
+                )
+                st.plotly_chart(fig_impact, use_container_width=True)
+                st.caption(
+                    "Impact Ratio > 1 แปลว่าราคาขยับแรงกว่าช่วงไม่มีข่าว (ยิ่งสูงยิ่งแปลว่าข่าวมีผลจริง) "
+                    "ค่าใกล้ 1 แปลว่าข่าวแทบไม่ต่างจากความผันผวนปกติของตลาด"
+                )
+
+            with col_b:
+                st.markdown("**ทิศทางที่ทำนายถูก (Direction Accuracy)**")
+                acc_plot_df = stats_df.dropna(subset=["Direction Accuracy %"])
+                if not acc_plot_df.empty:
+                    fig_acc = go.Figure()
+                    fig_acc.add_bar(
+                        x=acc_plot_df["Window"], y=acc_plot_df["Direction Accuracy %"],
+                        marker_color="#60a5fa",
+                        text=acc_plot_df["Direction Accuracy %"].astype(str) + "%",
+                        textposition="outside",
+                    )
+                    fig_acc.add_hline(y=50, line_dash="dash", line_color="#94a3b8",
+                                       annotation_text="สุ่มเดา 50%", annotation_font_color="#94a3b8")
+                    fig_acc.update_layout(
+                        height=330, margin=dict(l=20, r=20, t=20, b=30),
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0",
+                        yaxis_title="% ทายทิศทางถูก", yaxis_range=[0, 100]
+                    )
+                    st.plotly_chart(fig_acc, use_container_width=True)
+                else:
+                    st.info("ยังไม่มีข้อมูลพอคำนวณ accuracy")
+
+            st.markdown("**ตารางสรุปทั้งหมด**")
+            display_stats = stats_df.rename(columns={
+                "News Avg Move %": "News Move %",
+                "Baseline Avg Move %": "Baseline Move %",
+                "Direction Accuracy %": "Accuracy %",
+            })
+            st.dataframe(display_stats, use_container_width=True, hide_index=True)
+            st.caption(
+                "⚠️ ตัวอย่าง (N) ยังน้อยในบาง window — ตัวเลขอาจคลาดเคลื่อนได้มาก โดยเฉพาะ window ที่ N < 30 "
+                "ควรรอสะสมข้อมูลเพิ่มก่อนเชื่อผลลัพธ์เต็มที่"
+            )
+
     with tab_about:
         st.subheader("ℹ️ หลักการทำงานของระบบ")
         st.markdown(f"""
@@ -250,7 +406,10 @@ def _render_ui():
         3. **Gemini** วิเคราะห์ sentiment / confidence / คำแนะนำเชิงทิศทาง
         4. แจ้งเตือนเข้า Telegram เฉพาะรายการที่ **confidence ≥ {ALERT_CONFIDENCE_THRESHOLD}%** พร้อมระยะ lag ของข่าว
         5. **Fear & Greed Index** คำนวณจากสัดส่วน Bullish/Bearish สะสมทั้งหมด
+        6. **Market Impact tab**: เก็บราคา baseline (ไม่อิงข่าว) ทุก ~15 นาที เทียบกับราคาหลังข่าว
+           เพื่อวัดว่าข่าวทำให้ราคาขยับแรงกว่าปกติจริงไหม (impact) และ AI ทายทิศทางถูกกี่ % (accuracy)
 
         ⚠️ ระบบนี้มี lag จาก RSS โดยธรรมชาติ (นาทีถึงชั่วโมง) เหมาะสำหรับใช้เป็น**ข้อมูลประกอบการตัดสินใจ**
         ควบคู่กับระบบ technical indicator อื่น ไม่ควรใช้ตัดสินใจเข้า-ออกไม้เพียงลำพัง
         """)
+
