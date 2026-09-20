@@ -32,7 +32,7 @@ RSS_FEEDS = {
 }
 
 TARGET_ASSETS = ["BTC", "ETH", "NVDA", "GOLD", "XAUUSD", "FED", "SPY", "TSLA"]
-KEYWORDS = ["BTC", "ETH", "FED", "NVDA", "GOLD", "XAUUSD", "CALLS", "PUTS", "BITCOIN", "RATE CUT", "INFLATION", "SPY", "TSLA"]
+KEYWORDS = ["BTC", "ETH", "FED", "NVDA", "GOLD", "XAUUSD", "CALLS", "PUTS", "BITCOIN", "ETHEREUM", "RATE CUT", "INFLATION", "SPY", "TSLA"]
 INTERVAL_SECONDS = 180  # ตรวจเช็กทุก 3 นาที
 MAX_ANALYSES_PER_SCAN = 8   # จำกัดจำนวนข่าวที่ยิงเข้า Gemini ต่อรอบ กันชนโควตา
 GEMINI_CALL_DELAY_SECONDS = 4  # หน่วงเวลาระหว่างการเรียก Gemini แต่ละครั้ง
