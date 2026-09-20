@@ -63,10 +63,21 @@ def get_news_lag_minutes(entry):
         return None
 
 
+def _word_match(text_upper, keyword):
+    """เช็คว่า keyword ปรากฏเป็น 'คำ' จริงๆ ไม่ใช่แค่ substring ที่ซ่อนอยู่ในคำอื่น
+    (บั๊กที่เจอ: 'ETH' in 'WHETHER' → True ทั้งที่ไม่เกี่ยวกับ Ethereum เลย ทำให้ข่าว
+    'Here's whether the stock...' ถูกแท็กเป็นข่าว ETH ผิดๆ, เช่นเดียวกับ 'PUTS' ใน 'INPUTS',
+    'CALLS' ใน 'RECALLS', 'FED' ใน 'FEDEX' ฯลฯ — ใช้ word-boundary แทนแก้ปัญหานี้ทั้งหมด)"""
+    return re.search(rf"\b{re.escape(keyword)}\b", text_upper) is not None
+
+
 def detect_asset(text):
     text_upper = text.upper()
     for asset in TARGET_ASSETS:
-        if asset in text_upper or (asset == "BTC" and "BITCOIN" in text_upper) or (asset == "GOLD" and "XAU" in text_upper):
+        if (_word_match(text_upper, asset)
+                or (asset == "BTC" and _word_match(text_upper, "BITCOIN"))
+                or (asset == "ETH" and _word_match(text_upper, "ETHEREUM"))
+                or (asset == "GOLD" and _word_match(text_upper, "XAU"))):
             return asset
     return "General Market"
 
@@ -636,7 +647,7 @@ def background_bot_worker():
                     summary = entry.get("summary", "")
                     full_text = f"{title} {summary}"
 
-                    if any(k.lower() in full_text.lower() for k in KEYWORDS):
+                    if any(_word_match(full_text.upper(), k) for k in KEYWORDS):
                         # ด่านแรก: ให้ Groq คัดว่าเป็น catalyst จริงไหม ก่อนจะเปลือง Gemini quota
                         if groq_client and not screen_with_groq(groq_client, title):
                             processed_links.add(link)  # ไม่ต้องกลับมาดูซ้ำ ไม่ใช่ catalyst
