@@ -119,6 +119,37 @@ def get_live_price(asset):
         return None
 
 
+def get_price_context(asset):
+    """ดึงราคาปัจจุบันของ asset พร้อม % เปลี่ยนแปลงช่วง 1 ชม. และ 24 ชม. ล่าสุดจาก CoinGecko
+    (endpoint เดียวจบ ไม่ต้องยิง 2 รอบ) เพื่อป้อนเป็น "บริบทราคาจริง" ให้ Gemini ตอนวิเคราะห์ข่าว
+    แทนที่จะวิเคราะห์จากแค่ข้อความข่าวเปล่าๆ โดยไม่รู้เลยว่าตอนนี้ตลาดกำลังขึ้น/ลง/นิ่งอยู่
+    คืน None ถ้าไม่มีราคาให้ดึง (เช่น FED, GOLD, NVDA ตอนนี้ยังไม่รองรับ)"""
+    coingecko_id = COINGECKO_IDS.get(asset)
+    if not coingecko_id:
+        return None
+    try:
+        resp = _coingecko_get(
+            "https://api.coingecko.com/api/v3/coins/markets",
+            params={
+                "vs_currency": "usd",
+                "ids": coingecko_id,
+                "price_change_percentage": "1h,24h",
+            },
+        )
+        data = resp.json()
+        if not data:
+            return None
+        row = data[0]
+        return {
+            "price": row.get("current_price"),
+            "change_1h": row.get("price_change_percentage_1h_in_currency"),
+            "change_24h": row.get("price_change_percentage_24h_in_currency"),
+        }
+    except Exception as e:
+        print(f"CoinGecko price context error ({asset}): {type(e).__name__}: {e}")
+        return None
+
+
 def update_pending_price_checks():
     """เช็คว่าข่าวไหนถึงเวลาต้องบันทึกราคาหลังข่าวแล้วบ้าง (15นาที/1ชม./4ชม./24ชม.)
     เพื่อใช้วัด accuracy จริงทีหลังว่าราคาขยับตามที่ทำนายไหม"""
@@ -187,20 +218,45 @@ def _clean_summary(summary, max_len=600):
     return text[:max_len]
 
 
-def analyze_advanced(client, title, summary="", asset=""):
+def analyze_advanced(client, title, summary="", asset="", price_context=None):
     """วิเคราะห์ sentiment โดยใช้ทั้ง title และ summary/body ของข่าว (ไม่ใช่แค่ title เฉยๆ เหมือนเดิม)
     และให้เกณฑ์ confidence ที่ชัดเจนขึ้น เพื่อให้ค่าที่ได้สะท้อนโอกาสราคาขยับจริง
-    ไม่ใช่แค่ 'โทนข่าวฟังดูมั่นใจแค่ไหน' (ปัญหาที่พบจากการ backtest: confidence สูงกลับแม่นน้อยกว่า confidence ต่ำ)"""
+    ไม่ใช่แค่ 'โทนข่าวฟังดูมั่นใจแค่ไหน' (ปัญหาที่พบจากการ backtest: confidence สูงกลับแม่นน้อยกว่า confidence ต่ำ)
+    price_context (ถ้ามี จาก get_price_context()): dict {price, change_1h, change_24h} ราคาจริง ณ ตอนวิเคราะห์
+    ใช้เป็น "บริบทราคาจริง" ให้ Gemini เห็นว่าตลาดกำลังขึ้น/ลง/นิ่งอยู่ ไม่ใช่วิเคราะห์แค่ตัวข้อความข่าวเปล่าๆ"""
     clean_summary = _clean_summary(summary)
     body_block = f'\n    Body/summary: "{clean_summary}"' if clean_summary else ""
     asset_block = f"\n    Asset in focus: {asset}" if asset and asset != "General Market" else ""
 
+    price_block = ""
+    price_guidance = ""
+    if price_context and price_context.get("price") is not None:
+        p = price_context["price"]
+        c1h = price_context.get("change_1h")
+        c24h = price_context.get("change_24h")
+        c1h_str = f"{c1h:+.2f}%" if c1h is not None else "N/A"
+        c24h_str = f"{c24h:+.2f}%" if c24h is not None else "N/A"
+        price_block = (
+            f"\n    Live market data for {asset}: current price ${p:,.2f}, "
+            f"change over last 1h: {c1h_str}, change over last 24h: {c24h_str}."
+        )
+        price_guidance = """
+
+    You are also given the ACTUAL current price and recent trend for the asset above — weigh the news
+    against it, don't analyze the text in a vacuum:
+    - If the news direction agrees with the recent 1h/24h trend, that's a confirming signal — momentum
+      plus a real catalyst is a stronger case for the stated direction.
+    - If the news direction contradicts a strong recent trend, be more cautious: the market may already
+      have priced this in, or the move may already be exhausted — lower confidence unless the news is a
+      strong enough standalone catalyst to plausibly reverse the trend.
+    - If price has been essentially flat, treat the news mostly on its own merits."""
+
     prompt = f"""
     You are a professional market analyst screening news for SHORT-TERM (minutes-to-hours) trading signals.
 
-    Headline: "{title}"{body_block}{asset_block}
+    Headline: "{title}"{body_block}{asset_block}{price_block}
 
-    Analyze the market sentiment based on the FULL content above (headline AND body, not just the headline).
+    Analyze the market sentiment based on the FULL content above (headline AND body, not just the headline).{price_guidance}
 
     Confidence scoring guide — confidence must reflect how likely the price is to actually move in the
     stated direction within the next few hours, NOT how strongly-worded or dramatic the headline sounds:
