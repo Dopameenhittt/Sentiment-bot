@@ -613,6 +613,11 @@ def background_bot_worker():
     groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
     processed_links = load_processed_links()
     print(f"Loaded {len(processed_links)} previously processed links from Neon.")
+    # ลิงก์ที่ Gemini เพิ่งวิเคราะห์ล้มเหลว (โควตาเต็ม/503 ฯลฯ) — เก็บเวลาที่ล้มเหลวไว้ "ชั่วคราว" ในหน่วยความจำ
+    # (ไม่ใช่ processed_links ถาวรใน Neon) เพื่อพักไม่ลองซ้ำทันทีในรอบสแกนถัดไป กันไม่ให้ข่าวตัวเดิมที่พัง
+    # ค้างอยู่หัวคิวมาบล็อกข่าวใหม่ทุกรอบ 3 นาที แต่ก็ยังกลับมาลองใหม่ได้เองหลังพัก ไม่ทิ้งถาวรเหมือนเดิม
+    failed_links = {}
+    FAILED_RETRY_COOLDOWN_SECONDS = 1800  # พัก 30 นาทีก่อนลองข่าวเดิมอีกครั้ง
     backfill_historical_prices()  # เติมราคาย้อนหลังให้ข่าว BTC/ETH เก่า (รันครั้งเดียวตอนเริ่ม)
     backfill_baseline_prices()  # เติม baseline sample ย้อนหลัง (รันครั้งเดียว ใช้เทียบกับข่าวได้ทันที ไม่ต้องรอสะสมใหม่)
     run_prompt_backtest_once(client)  # เทส prompt ใหม่กับข่าวเก่าที่รู้ผลจริงแล้ว (รันครั้งเดียว)
@@ -633,6 +638,12 @@ def background_bot_worker():
             analyses_this_scan = 0
             skipped_by_groq = 0
             quota_hit = False
+            consecutive_failures = 0
+            # ถ้า Gemini พังติดกันหลายครั้งในรอบเดียว แปลว่าโควตาน่าจะหมดจริงๆ วันนี้
+            # ให้หยุดยิงต่อ (กันเสียเวลา/เสีย call เปล่าๆ) แต่ "ไม่" mark ข่าวที่เหลือว่า processed
+            # ต่างจากเดิมตรงที่ตัวข่าวที่ยังไม่ได้ลองเลยในรอบนี้จะไม่ถูกแตะต้องอะไรเลย รอรอบหน้าตามปกติ
+            CONSECUTIVE_FAILURE_LIMIT = 3
+            now_ts = time.time()
             for source_name, url in RSS_FEEDS.items():
                 if quota_hit:
                     break
@@ -645,6 +656,14 @@ def background_bot_worker():
                     link = entry.get("link", "")
                     if not link or link in processed_links:
                         continue
+
+                    # ลิงก์นี้เพิ่งพังไปเมื่อไม่นานมานี้ — พักไว้ก่อน ยังไม่ mark processed
+                    # (จะได้ลองใหม่เองหลังพักครบ ไม่ทิ้งถาวรและไม่เปลือง Gemini call ซ้ำๆ)
+                    failed_at = failed_links.get(link)
+                    if failed_at is not None:
+                        if (now_ts - failed_at) < FAILED_RETRY_COOLDOWN_SECONDS:
+                            continue
+                        failed_links.pop(link, None)  # พักครบแล้ว ล้างออกจาก cooldown ลองใหม่ได้
 
                     title = entry.get("title", "")
                     summary = entry.get("summary", "")
@@ -666,13 +685,24 @@ def background_bot_worker():
 
                         if res is None:
                             # Gemini ล้มเหลว (โควตาเต็ม/503 ฯลฯ) — "ไม่" mark ว่าประมวลผลแล้ว
-                            # ปล่อยให้ scan รอบถัดไป (หรือวันถัดไปหลังโควตารีเซ็ต) กลับมา retry ข่าวนี้ได้จริง
-                            # แต่ก่อนเคย mark processed_links เสมอไม่ว่าจะสำเร็จหรือพัง ทำให้ข่าวจริงที่มา
-                            # ตอนโควตาเต็มถูกทิ้งถาวร ไม่เคยถูกวิเคราะห์เลย — นี่คือจุดที่แก้
+                            # แค่จด timestamp ไว้ใน failed_links เพื่อพัก (cooldown) ไม่ลองซ้ำทันที
+                            # แล้ว "continue" ไปข่าวถัดไปในรอบเดียวกันนี้เลย — ไม่ break ทั้ง scan
+                            # เหมือนรอบที่แล้ว ซึ่งทำให้ข่าวตัวแรกที่พังบล็อกข่าวใหม่ทุกตัวทุกรอบ
+                            failed_links[link] = time.time()
+                            consecutive_failures += 1
                             print(f"[{time.strftime('%H:%M:%S')}] Gemini failed for '{title[:60]}' "
-                                  f"— skip mark-as-processed, will retry later")
-                            quota_hit = True  # หยุดยิงต่อในรอบนี้ (call ถัดไปมีแนวโน้มพังซ้ำ เสียเวลาเปล่า)
-                            break
+                                  f"— cooldown {FAILED_RETRY_COOLDOWN_SECONDS}s, will retry later "
+                                  f"(consecutive fails: {consecutive_failures})")
+                            if consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
+                                # พังติดกันหลายครั้ง โควตาน่าจะหมดจริงจังวันนี้ — หยุดยิงต่อในรอบนี้
+                                # เพื่อไม่เสียเวลา/call เปล่า แต่ข่าวที่เหลือยังไม่ถูกแตะเลย ไม่ใช่ถูกทิ้ง
+                                quota_hit = True
+                                break
+                            continue
+
+                        # สำเร็จแล้ว เอาลิงก์นี้ออกจาก cooldown list ถ้าเคยพังมาก่อน (ไม่ต้องพักอีกต่อไป)
+                        failed_links.pop(link, None)
+                        consecutive_failures = 0
 
                         record = {
                             "source": source_name,
