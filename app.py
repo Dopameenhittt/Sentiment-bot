@@ -760,8 +760,11 @@ def background_bot_worker():
     FAILED_RETRY_COOLDOWN_SECONDS = 1800  # พัก 30 นาทีก่อนลองข่าวเดิมอีกครั้ง
     backfill_historical_prices()  # เติมราคาย้อนหลังให้ข่าว BTC/ETH เก่า (รันครั้งเดียวตอนเริ่ม)
     backfill_baseline_prices()  # เติม baseline sample ย้อนหลัง (รันครั้งเดียว ใช้เทียบกับข่าวได้ทันที ไม่ต้องรอสะสมใหม่)
-    run_prompt_backtest_once(client)  # เทส prompt ใหม่กับข่าวเก่าที่รู้ผลจริงแล้ว (รันครั้งเดียว)
-    run_price_context_backtest_once(client)  # เทสฟีเจอร์บริบทราคาจริงกับข่าวเก่าชุดเดียวกัน (รันครั้งเดียว)
+    # ปิดการรัน backtest อัตโนมัติตอน worker เริ่มทำงานแล้ว (ทั้ง run_prompt_backtest_once และ
+    # run_price_context_backtest_once) เพราะมันแย่งโควตา Gemini ที่มีจำกัดมาก (20/วัน) ไปจากข่าวสดจริง
+    # โดยเฉพาะ run_price_context_backtest_once ที่ยังไม่เคยสำเร็จสักรายการ (v3_sentiment เป็น NULL อยู่)
+    # จะพยายามรันซ้ำทุกครั้งที่ worker restart แย่งโควตาไปเรื่อยๆ — ฟังก์ชันยังอยู่ในไฟล์ เรียกเองได้ทีหลัง
+    # ถ้าต้องการเทสข่าวเก่าอีกครั้ง แต่ตอนนี้ให้ความสำคัญกับข่าวสดที่เข้ามาใหม่ก่อนเป็นหลัก
 
     scan_count = 0
     # สุ่มเก็บ baseline price ทุกๆ BASELINE_SAMPLE_EVERY รอบ (รอบละ INTERVAL_SECONDS วิ)
