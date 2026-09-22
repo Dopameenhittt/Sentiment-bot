@@ -317,6 +317,20 @@ def get_price_at(coingecko_id, dt):
         return None
 
 
+def get_historical_price_context(coingecko_id, ts, price_now):
+    """เวอร์ชัน backtest ของ get_price_context(): คำนวณ % เปลี่ยนแปลงราคาช่วง 1 ชม./24 ชม.
+    "ก่อน" เวลา ts ที่กำหนด (ใช้ตอนเทสข่าวเก่า เพราะต้องดูราคา ณ ตอนนั้นจริงๆ ไม่ใช่ราคาปัจจุบัน
+    เหมือน get_price_context() ที่ใช้กับข่าวสด) — price_now คือ price_at_alert ที่บันทึกไว้แล้วตอนนั้น"""
+    from datetime import timedelta as _td
+    price_1h_ago = get_price_at(coingecko_id, ts - _td(hours=1))
+    time.sleep(1.5)
+    price_24h_ago = get_price_at(coingecko_id, ts - _td(hours=24))
+    time.sleep(1.5)
+    change_1h = ((price_now - price_1h_ago) / price_1h_ago * 100) if price_1h_ago else None
+    change_24h = ((price_now - price_24h_ago) / price_24h_ago * 100) if price_24h_ago else None
+    return {"price": price_now, "change_1h": change_1h, "change_24h": change_24h}
+
+
 def backfill_historical_prices():
     """รันครั้งเดียวตอน bot เริ่มทำงาน: เติมราคาย้อนหลังให้ข่าว BTC/ETH เก่าที่ยังไม่มี price_at_alert
     (ข่าวใหม่จากนี้ไป save_records()/update_pending_price_checks() จะเก็บราคาให้เองแบบ real-time)
@@ -599,6 +613,76 @@ def run_prompt_backtest_once(client):
         print(f"Prompt backtest error: {type(e).__name__}: {e}")
 
 
+def run_price_context_backtest_once(client):
+    """เทสฟีเจอร์ 'บริบทราคาจริง' (price_context) กับข่าวเก่าชุดเดียวกับที่เคยเทส prompt ใหม่ไปแล้ว
+    (แถวใน prompt_backtest_results ที่ยังไม่มี v3_sentiment) เพื่อเทียบ 3 แบบในแถวเดียวกัน:
+    old_* = prompt เดิมตอนนั้นจริงๆ, new_* = prompt ใหม่ (body+confidence calibration, ไม่มีราคา),
+    v3_* = prompt ใหม่ + บริบทราคาจริง (ราคาย้อนหลัง ณ ตอนนั้น ไม่ใช่ราคาปัจจุบัน)
+    รันครั้งเดียวเท่านั้น (เช็คว่ามีแถวไหน v3_sentiment ยังเป็น NULL อยู่บ้าง) เพื่อประหยัดโควตา Gemini"""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT p.link, p.asset, p.title, p.old_sentiment, p.old_confidence, p.old_correct,
+                           m.timestamp, m.price_at_alert
+                    FROM prompt_backtest_results p
+                    JOIN market_sentiment m ON m.link = p.link
+                    WHERE p.v3_sentiment IS NULL
+                      AND m.asset IN ('BTC','ETH') AND m.price_at_alert IS NOT NULL;
+                """)
+                rows = cur.fetchall()
+
+        if not rows:
+            print("Price-context backtest: เคยรันไปแล้ว หรือไม่มีแถวให้เทส ข้าม (กันเปลืองโควตา Gemini)")
+            return
+
+        print(f"Price-context backtest: กำลังเทสบริบทราคาย้อนหลังกับข่าวเก่า {len(rows)} รายการ")
+        for link, asset, title, old_sentiment, old_confidence, old_correct, ts, price_at_alert in rows:
+            coingecko_id = COINGECKO_IDS.get(asset)
+            if not coingecko_id:
+                continue
+            if ts.tzinfo is None:
+                from datetime import timezone as _tz
+                ts = ts.replace(tzinfo=_tz.utc)
+
+            price_context = get_historical_price_context(coingecko_id, ts, float(price_at_alert))
+
+            res = analyze_advanced(client, title, "", asset, price_context)
+            time.sleep(GEMINI_CALL_DELAY_SECONDS)
+            if res is None:
+                print(f"Price-context backtest: Gemini ล้มเหลวสำหรับ '{title[:60]}' ข้ามรายการนี้")
+                continue
+            v3_sentiment = res.get("sentiment", "Neutral")
+            v3_confidence = res.get("confidence", 50)
+            v3_reason = res.get("reason", "-")
+
+            actual_up = (old_sentiment == "Bullish") == old_correct
+            v3_correct = None
+            if v3_sentiment in ("Bullish", "Bearish"):
+                v3_correct = (v3_sentiment == "Bullish") == actual_up
+
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE prompt_backtest_results
+                            SET v3_sentiment = %s, v3_confidence = %s, v3_correct = %s,
+                                v3_reason = %s, v3_change_1h = %s, v3_change_24h = %s
+                            WHERE link = %s;
+                            """,
+                            (v3_sentiment, v3_confidence, v3_correct, v3_reason,
+                             price_context.get("change_1h"), price_context.get("change_24h"), link)
+                        )
+                    conn.commit()
+            except Exception as e:
+                print(f"Price-context backtest save error: {type(e).__name__}: {e}")
+
+        print(f"Price-context backtest: เทสเสร็จสิ้น {len(rows)} รายการ ดูผลได้จากคอลัมน์ v3_* ในตาราง prompt_backtest_results")
+    except Exception as e:
+        print(f"Price-context backtest error: {type(e).__name__}: {e}")
+
+
 def load_processed_links():
     """โหลดลิงก์ที่เคยวิเคราะห์แล้วจาก Neon ตอน bot เริ่มทำงาน"""
     links = set()
@@ -677,6 +761,7 @@ def background_bot_worker():
     backfill_historical_prices()  # เติมราคาย้อนหลังให้ข่าว BTC/ETH เก่า (รันครั้งเดียวตอนเริ่ม)
     backfill_baseline_prices()  # เติม baseline sample ย้อนหลัง (รันครั้งเดียว ใช้เทียบกับข่าวได้ทันที ไม่ต้องรอสะสมใหม่)
     run_prompt_backtest_once(client)  # เทส prompt ใหม่กับข่าวเก่าที่รู้ผลจริงแล้ว (รันครั้งเดียว)
+    run_price_context_backtest_once(client)  # เทสฟีเจอร์บริบทราคาจริงกับข่าวเก่าชุดเดียวกัน (รันครั้งเดียว)
 
     scan_count = 0
     # สุ่มเก็บ baseline price ทุกๆ BASELINE_SAMPLE_EVERY รอบ (รอบละ INTERVAL_SECONDS วิ)
@@ -700,6 +785,7 @@ def background_bot_worker():
             # ต่างจากเดิมตรงที่ตัวข่าวที่ยังไม่ได้ลองเลยในรอบนี้จะไม่ถูกแตะต้องอะไรเลย รอรอบหน้าตามปกติ
             CONSECUTIVE_FAILURE_LIMIT = 3
             now_ts = time.time()
+            price_context_cache = {}  # กันยิง CoinGecko ซ้ำถ้ามีข่าว asset เดียวกันหลายชิ้นในรอบเดียว
             for source_name, url in RSS_FEEDS.items():
                 if quota_hit:
                     break
@@ -735,7 +821,14 @@ def background_bot_worker():
 
                         asset_tag = detect_asset(full_text)
                         lag_minutes = get_news_lag_minutes(entry)
-                        res = analyze_advanced(client, title, summary, asset_tag)
+
+                        # ดึงราคาจริง+เทรนด์ล่าสุด (ถ้า asset นี้มีราคาให้ดึง เช่น BTC/ETH) มาป้อนเป็น
+                        # context ให้ Gemini เห็นว่าตอนนี้ตลาดขึ้น/ลง/นิ่งอยู่ ไม่ใช่วิเคราะห์แค่ข้อความข่าวเปล่าๆ
+                        if asset_tag not in price_context_cache:
+                            price_context_cache[asset_tag] = get_price_context(asset_tag)
+                        price_context = price_context_cache[asset_tag]
+
+                        res = analyze_advanced(client, title, summary, asset_tag, price_context)
                         analyses_this_scan += 1
                         time.sleep(GEMINI_CALL_DELAY_SECONDS)  # กันยิงรัวจนชนโควตา
 
