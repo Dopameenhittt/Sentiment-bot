@@ -91,7 +91,7 @@ def _render_ui():
                     SELECT source AS "Source", asset AS "Asset", title AS "Title",
                            sentiment AS "Sentiment", confidence AS "Confidence",
                            action AS "Action", reason AS "Reason", link AS "Link",
-                           timestamp AS "Timestamp"
+                           timestamp AS "Timestamp", lag_minutes AS "Lag (min)"
                     FROM market_sentiment
                     ORDER BY timestamp DESC
                     LIMIT 500;
@@ -305,7 +305,11 @@ def _render_ui():
         st.subheader("📰 Real-time News & Trade Recommendation")
 
         high_conf = df[df["Confidence"].astype(float) >= ALERT_CONFIDENCE_THRESHOLD]
-        st.caption(f"🔔 {len(high_conf)} รายการผ่านเกณฑ์แจ้งเตือน (confidence ≥ {ALERT_CONFIDENCE_THRESHOLD}%) จากทั้งหมด {total_posts} รายการ")
+        lag_caption = ""
+        if "Lag (min)" in df.columns and df["Lag (min)"].notna().any():
+            avg_lag = round(df["Lag (min)"].dropna().astype(float).mean(), 1)
+            lag_caption = f" · ⏱ lag เฉลี่ย {avg_lag} นาที (นับจากข่าวเผยแพร่ถึงตอนวิเคราะห์เสร็จ)"
+        st.caption(f"🔔 {len(high_conf)} รายการผ่านเกณฑ์แจ้งเตือน (confidence ≥ {ALERT_CONFIDENCE_THRESHOLD}%) จากทั้งหมด {total_posts} รายการ{lag_caption}")
 
         display_df = df.sort_values(by="Timestamp", ascending=False).copy() if "Timestamp" in df.columns else df.copy()
         st.dataframe(

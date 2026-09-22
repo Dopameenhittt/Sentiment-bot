@@ -232,12 +232,11 @@ def analyze_advanced(client, title, summary="", asset=""):
         return json.loads(response.text.strip())
     except Exception as e:
         print(f"Gemini analyze error: {type(e).__name__}: {e}")
-        return {
-            "sentiment": "Neutral",
-            "confidence": 50,
-            "action": "Wait and See",
-            "reason": "Analysis unavailable"
-        }
+        # สำคัญ: คืน None แทนการยัด fallback dict ปลอมๆ เข้าไป — เดิมทีเคย return
+        # {"sentiment": "Neutral", "reason": "Analysis unavailable"} ซึ่งทำให้โค้ดที่เรียกใช้แยกไม่ออก
+        # ระหว่าง "วิเคราะห์แล้วได้ Neutral จริง" กับ "Gemini ล้มเหลว (โควตาเต็ม/503)" แล้วดัน mark ว่า
+        # ข่าวนั้น "ประมวลผลแล้ว" ทั้งที่ไม่ได้วิเคราะห์จริง ทำให้ข่าวที่มาตอนโควตาเต็มถูกทิ้งถาวร ไม่มีวัน retry
+        return None
 
 
 def get_price_at(coingecko_id, dt):
@@ -509,6 +508,9 @@ def run_prompt_backtest_once(client):
         for link, asset, title, old_sentiment, old_confidence, old_correct in candidates:
             res = analyze_advanced(client, title, "", asset)
             time.sleep(GEMINI_CALL_DELAY_SECONDS)
+            if res is None:
+                print(f"Prompt backtest: Gemini ล้มเหลวสำหรับ '{title[:60]}' ข้ามรายการนี้")
+                continue
             new_sentiment = res.get("sentiment", "Neutral")
             new_confidence = res.get("confidence", 50)
             new_reason = res.get("reason", "-")
@@ -566,12 +568,13 @@ def save_records(rows, skipped_links=None):
                     cur.execute(
                         """
                         INSERT INTO market_sentiment
-                            (link, source, asset, title, sentiment, confidence, action, reason, price_at_alert)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            (link, source, asset, title, sentiment, confidence, action, reason, price_at_alert, lag_minutes)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (link) DO NOTHING;
                         """,
                         (r["link"], r["source"], r["asset"], r["title"],
-                         r["sentiment"], r["confidence"], r["action"], r["reason"], price_at_alert)
+                         r["sentiment"], r["confidence"], r["action"], r["reason"], price_at_alert,
+                         r.get("lag_minutes"))
                     )
                     cur.execute(
                         """
@@ -661,6 +664,16 @@ def background_bot_worker():
                         analyses_this_scan += 1
                         time.sleep(GEMINI_CALL_DELAY_SECONDS)  # กันยิงรัวจนชนโควตา
 
+                        if res is None:
+                            # Gemini ล้มเหลว (โควตาเต็ม/503 ฯลฯ) — "ไม่" mark ว่าประมวลผลแล้ว
+                            # ปล่อยให้ scan รอบถัดไป (หรือวันถัดไปหลังโควตารีเซ็ต) กลับมา retry ข่าวนี้ได้จริง
+                            # แต่ก่อนเคย mark processed_links เสมอไม่ว่าจะสำเร็จหรือพัง ทำให้ข่าวจริงที่มา
+                            # ตอนโควตาเต็มถูกทิ้งถาวร ไม่เคยถูกวิเคราะห์เลย — นี่คือจุดที่แก้
+                            print(f"[{time.strftime('%H:%M:%S')}] Gemini failed for '{title[:60]}' "
+                                  f"— skip mark-as-processed, will retry later")
+                            quota_hit = True  # หยุดยิงต่อในรอบนี้ (call ถัดไปมีแนวโน้มพังซ้ำ เสียเวลาเปล่า)
+                            break
+
                         record = {
                             "source": source_name,
                             "asset": asset_tag,
@@ -670,6 +683,7 @@ def background_bot_worker():
                             "action": res.get("action", "Wait and See"),
                             "reason": res.get("reason", "-"),
                             "link": link,
+                            "lag_minutes": lag_minutes,
                         }
                         new_records.append(record)
                         processed_links.add(link)
